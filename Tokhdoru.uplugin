@@ -1,0 +1,28 @@
+{
+    "FileVersion": 3,
+    "Version": 1,
+    "VersionName": "1.0",
+    "FriendlyName": "Tokhdoru",
+    "Description": "Urban Space Generation Plugin using CGAL",
+    "Category": "Rendering",
+    "CanContainContent": true,
+    "IsBetaVersion": false,
+    "Installed": false,
+    "Modules": [
+        {
+            "Name": "TokhdoruCGAL",
+            "Type": "Runtime",
+            "LoadingPhase": "PreDefault"
+        },
+        {
+            "Name": "Tokhdoru",
+            "Type": "Runtime",
+            "LoadingPhase": "Default"
+        },
+        {
+            "Name": "TokhdoruEditor",
+            "Type": "Editor",
+            "LoadingPhase": "Default"
+        }
+    ]
+}
