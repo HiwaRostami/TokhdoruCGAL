@@ -23,7 +23,7 @@ bool FGeoJSONLoader::LoadGeoJSON(const FString& FilePath)
 bool FGeoJSONLoader::LoadGeoJSONFromString(const FString& JsonString)
 {
 	Buildings.Empty(); Roads.Empty(); Waters.Empty(); Vegetations.Empty(); POIs.Empty();
-	Trees.Empty(); Railways.Empty();
+	Trees.Empty(); Railways.Empty(); ElevationSamples.Empty(); ModelInstances.Empty();
 	MinLat = DBL_MAX; MaxLat = -DBL_MAX; MinLon = DBL_MAX; MaxLon = -DBL_MAX;
 
 	// Parse JSON on game thread (UE JSON system is not thread-safe)
@@ -103,6 +103,26 @@ void FGeoJSONLoader::ParsePoint(const TArray<TSharedPtr<FJsonValue>>& Coordinate
 	MinLat = FMath::Min(MinLat, Lat); MaxLat = FMath::Max(MaxLat, Lat);
 	MinLon = FMath::Min(MinLon, Lon); MaxLon = FMath::Max(MaxLon, Lon);
 
+	double Ele = 0.0;
+	bool bHasEle = false;
+	if (Coordinates.Num() >= 3)
+	{
+		Ele = Coordinates[2]->AsNumber();
+		bHasEle = true;
+	}
+	if (Properties.IsValid() && Properties->HasField(TEXT("ele")))
+	{
+		Ele = FCString::Atod(*Properties->GetStringField(TEXT("ele")));
+		bHasEle = true;
+	}
+	if (bHasEle)
+	{
+		FElevationSample Sample;
+		Sample.RawLonLat = FDoublePoint2D(Lon, Lat);
+		Sample.Elevation = Ele;
+		ElevationSamples.Add(Sample);
+	}
+
 	// Check if this point is a tree (natural=tree)
 	if (Properties.IsValid() && Properties->HasField(TEXT("natural")))
 	{
@@ -154,6 +174,14 @@ void FGeoJSONLoader::ParseLineString(const TArray<TSharedPtr<FJsonValue>>& Coord
 				MinLon = FMath::Min(MinLon, Lon); MaxLon = FMath::Max(MaxLon, Lon);
 				Points.Add(FVector2D(static_cast<float>(Lon), static_cast<float>(Lat)));
 				RawPoints.Add(FDoublePoint2D(Lon, Lat));
+
+				if (Coord.Num() >= 3)
+				{
+					FElevationSample Sample;
+					Sample.RawLonLat = FDoublePoint2D(Lon, Lat);
+					Sample.Elevation = Coord[2]->AsNumber();
+					ElevationSamples.Add(Sample);
+				}
 			}
 		}
 	}
@@ -564,6 +592,10 @@ void FGeoJSONLoader::ConvertAllCoordsToLocal()
 		{
 			for (FVector2D& P : R.Points) P = LatLonToLocalCoords(P.Y, P.X, CenterLatitude, CenterLongitude);
 		}
+	}
+	for (FElevationSample& E : ElevationSamples)
+	{
+		E.Location = LatLonToLocalCoords(E.RawLonLat.Y, E.RawLonLat.X, CenterLatitude, CenterLongitude);
 	}
 }
 

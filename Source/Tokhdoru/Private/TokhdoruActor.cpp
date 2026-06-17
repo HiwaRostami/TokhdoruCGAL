@@ -9,6 +9,8 @@
 #include "Engine/StaticMesh.h"
 #include "Materials/Material.h"
 #include "Materials/MaterialInstanceDynamic.h"
+#include "Engine/Texture.h"
+
 
 // ============================================================================
 // Constructor
@@ -21,10 +23,20 @@ ATokhdoruActor::ATokhdoruActor()
         GroundOffset       = 0.0f;
         bUseGeoJSON        = true;
         bUseVertexColorMaterial = true;
+        b3DWindow          = false;
+        bUseTerrainElevation = true;
+        TerrainGridSubdivisions = 48;
+        bShowRailways      = true;
+        bShowPOIMarkers    = true;
+        bUsePBRMaterials   = true;
+        POIMarkerRadius    = 80.f;
+        POIMarkerHeight    = 250.f;
         TreeDensityScale   = 1.0f;
         GrassDensityScale  = 1.0f;
         MaxTreeInstances   = 2000;
         MaxGrassInstances  = 5000;
+        ModelScale         = 1.0f;
+        ModelBaseRotation  = FRotator(0.f, 0.f, 90.f); // stand up Y-up GLB models
 
         // ---------- Root ----------
         DefaultRoot = CreateDefaultSubobject<USceneComponent>(TEXT("DefaultRoot"));
@@ -45,6 +57,8 @@ ATokhdoruActor::ATokhdoruActor()
         GroundMeshComp     = MakePMC(TEXT("GroundMesh"));
         RoofMeshComp       = MakePMC(TEXT("RoofMesh"));
         VegetationMeshComp = MakePMC(TEXT("VegetationMesh"));
+        RailwayMeshComp    = MakePMC(TEXT("RailwayMesh"));
+        POIMeshComp        = MakePMC(TEXT("POIMesh"));
 
         // ---------- Instanced Static Mesh Components ----------
         TreeInstancedComp = CreateDefaultSubobject<UInstancedStaticMeshComponent>(TEXT("TreeInstanced"));
@@ -55,57 +69,58 @@ ATokhdoruActor::ATokhdoruActor()
         GrassInstancedComp->SetupAttachment(RootComponent);
         GrassInstancedComp->SetMobility(EComponentMobility::Movable);
 
-        // ---------- Default Material Assets ----------
-        static ConstructorHelpers::FObjectFinder<UMaterialInterface> WallMat(
-                TEXT("Material'/Tokhdoru/Materials/Wall/Wall_1.Wall_1'"));
-        if (WallMat.Succeeded()) BuildingWallMaterial = WallMat.Object;
+        // ---------- Default Material Assets (imported from streets-gl) ----------
+        // These live in the plugin Content folder under /Tokhdoru/Materials/.
+        BuildingWallMaterial    = nullptr;
+        BuildingGlassMaterial   = nullptr;
+        BrickFacadeMaterial     = nullptr;
+        DarkStoneFacadeMaterial = nullptr;
+        LightStoneFacadeMaterial= nullptr;
+        RoofMaterial            = nullptr;
+        RoadMaterial            = nullptr;
+        SidewalkMaterial        = nullptr;
+        WaterMaterial           = nullptr;
+        GroundGrassMaterial     = nullptr;
+        VegetationMaterial      = nullptr;
+        RailwayBallastMaterial  = nullptr;
+        RailwayRailMaterial     = nullptr;
+        POIMaterial             = nullptr;
 
-        static ConstructorHelpers::FObjectFinder<UMaterialInterface> GlassMat(
-                TEXT("Material'/Tokhdoru/Materials/Glass/Glass.Glass'"));
-        if (GlassMat.Succeeded()) BuildingGlassMaterial = GlassMat.Object;
+        static ConstructorHelpers::FObjectFinder<UMaterialInterface> BuildingMat(
+                TEXT("/Tokhdoru/Materials/M_Building.M_Building"));
+        if (BuildingMat.Succeeded()) BuildingWallMaterial = BuildingMat.Object;
 
         static ConstructorHelpers::FObjectFinder<UMaterialInterface> RoofMat(
-                TEXT("Material'/Tokhdoru/Materials/Roof/Roof.Roof'"));
+                TEXT("/Tokhdoru/Materials/M_Roof.M_Roof"));
         if (RoofMat.Succeeded()) RoofMaterial = RoofMat.Object;
 
         static ConstructorHelpers::FObjectFinder<UMaterialInterface> RoadMat(
-                TEXT("Material'/Tokhdoru/Materials/Asphalt/Asphalt.Asphalt'"));
+                TEXT("/Tokhdoru/Materials/M_Road.M_Road"));
         if (RoadMat.Succeeded()) RoadMaterial = RoadMat.Object;
 
-        static ConstructorHelpers::FObjectFinder<UMaterialInterface> SWMat(
-                TEXT("Material'/Tokhdoru/Materials/Sidewalk/Sidewalk.Sidewalk'"));
-        if (SWMat.Succeeded()) SidewalkMaterial = SWMat.Object;
+        // M_Area covers projected ground areas: sidewalks/pavement and vegetation.
+        static ConstructorHelpers::FObjectFinder<UMaterialInterface> AreaMat(
+                TEXT("/Tokhdoru/Materials/M_Area.M_Area"));
+        if (AreaMat.Succeeded()) { SidewalkMaterial = AreaMat.Object; VegetationMaterial = AreaMat.Object; }
 
         static ConstructorHelpers::FObjectFinder<UMaterialInterface> WaterMat(
-                TEXT("Material'/Tokhdoru/Materials/Water/Water.Water'"));
+                TEXT("/Tokhdoru/Materials/M_Water.M_Water"));
         if (WaterMat.Succeeded()) WaterMaterial = WaterMat.Object;
 
-        static ConstructorHelpers::FObjectFinder<UMaterialInterface> GroundMat(
-                TEXT("Material'/Tokhdoru/Materials/BaseMaterial/Base.Base'"));
-        if (GroundMat.Succeeded()) GroundGrassMaterial = GroundMat.Object;
+        static ConstructorHelpers::FObjectFinder<UMaterialInterface> TerrainMat(
+                TEXT("/Tokhdoru/Materials/M_Terrain.M_Terrain"));
+        if (TerrainMat.Succeeded()) GroundGrassMaterial = TerrainMat.Object;
 
-        static ConstructorHelpers::FObjectFinder<UMaterialInterface> VegMat(
-                TEXT("Material'/Tokhdoru/Materials/Grass/Meadow.Meadow'"));
-        if (VegMat.Succeeded()) VegetationMaterial = VegMat.Object;
-
-        static ConstructorHelpers::FObjectFinder<UMaterialInterface> BrickMat(
-                TEXT("MaterialInstanceConstant'/Tokhdoru/Materials/Brick/MI_Brick_Facade_ulmmccpo_2K.MI_Brick_Facade_ulmmccpo_2K'"));
-        if (BrickMat.Succeeded()) BrickFacadeMaterial = BrickMat.Object;
-
-        static ConstructorHelpers::FObjectFinder<UMaterialInterface> DarkStoneMat(
-                TEXT("MaterialInstanceConstant'/Tokhdoru/Materials/Stone/MI_Via_Lattea_Granite_weoldhcv_4K.MI_Via_Lattea_Granite_weoldhcv_4K'"));
-        if (DarkStoneMat.Succeeded()) DarkStoneFacadeMaterial = DarkStoneMat.Object;
-
-        static ConstructorHelpers::FObjectFinder<UMaterialInterface> LightStoneMat(
-                TEXT("MaterialInstanceConstant'/Tokhdoru/Materials/Stone/MI_Off_White_Tiles_tfihaepg_4K.MI_Off_White_Tiles_tfihaepg_4K'"));
-        if (LightStoneMat.Succeeded()) LightStoneFacadeMaterial = LightStoneMat.Object;
+        static ConstructorHelpers::FObjectFinder<UMaterialInterface> RailwayMat(
+                TEXT("/Tokhdoru/Materials/M_Railway.M_Railway"));
+        if (RailwayMat.Succeeded()) { RailwayBallastMaterial = RailwayMat.Object; RailwayRailMaterial = RailwayMat.Object; }
 
         static ConstructorHelpers::FObjectFinder<UStaticMesh> TreeMeshAsset(
-                TEXT("StaticMesh'/Tokhdoru/StaticMeshes/Trees/PCG_Tree_02.PCG_Tree_02'"));
+                TEXT("StaticMesh'/Tokhdoru/Models/Trees/PCG_Tree_02.PCG_Tree_02'"));
         if (TreeMeshAsset.Succeeded()) { TreeMesh = TreeMeshAsset.Object; TreeInstancedComp->SetStaticMesh(TreeMesh); }
 
         static ConstructorHelpers::FObjectFinder<UStaticMesh> GrassMeshAsset(
-                TEXT("StaticMesh'/Tokhdoru/StaticMeshes/Grass/GRASS.GRASS'"));
+                TEXT("StaticMesh'/Tokhdoru/Models/Grass/GRASS.GRASS'"));
         if (GrassMeshAsset.Succeeded()) { GrassMesh = GrassMeshAsset.Object; GrassInstancedComp->SetStaticMesh(GrassMesh); }
 }
 
@@ -118,6 +133,23 @@ void ATokhdoruActor::BeginPlay()
 }
 
 // ============================================================================
+// PostActorCreated - force newly placed actors to the world origin
+// ============================================================================
+void ATokhdoruActor::PostActorCreated()
+{
+        Super::PostActorCreated();
+
+        // Only when first created in the editor (drag-drop / placement). Actors
+        // streamed in from a saved map go through PostLoad instead, so their saved
+        // transform is preserved. Runtime game spawns are left untouched.
+        if (UWorld* W = GetWorld())
+        {
+                if (!W->IsGameWorld())
+                        SetActorTransform(FTransform::Identity);
+        }
+}
+
+// ============================================================================
 // LoadDefaultAssets
 // ============================================================================
 void ATokhdoruActor::LoadDefaultAssets()
@@ -127,26 +159,36 @@ void ATokhdoruActor::LoadDefaultAssets()
                 if (!Mat) Mat = LoadObject<UMaterialInterface>(nullptr, Path);
         };
 
-        TryLoad(BuildingWallMaterial,    TEXT("Material'/Tokhdoru/Materials/Wall/Wall_1.Wall_1'"));
-        TryLoad(BuildingGlassMaterial,   TEXT("Material'/Tokhdoru/Materials/Glass/Glass.Glass'"));
-        TryLoad(RoofMaterial,            TEXT("Material'/Tokhdoru/Materials/Roof/Roof.Roof'"));
-        TryLoad(RoadMaterial,            TEXT("Material'/Tokhdoru/Materials/Asphalt/Asphalt.Asphalt'"));
-        TryLoad(SidewalkMaterial,        TEXT("Material'/Tokhdoru/Materials/Sidewalk/Sidewalk.Sidewalk'"));
-        TryLoad(WaterMaterial,           TEXT("Material'/Tokhdoru/Materials/Water/Water.Water'"));
-        TryLoad(GroundGrassMaterial,     TEXT("Material'/Tokhdoru/Materials/BaseMaterial/Base.Base'"));
-        TryLoad(VegetationMaterial,      TEXT("Material'/Tokhdoru/Materials/Grass/Meadow.Meadow'"));
-        TryLoad(BrickFacadeMaterial,     TEXT("MaterialInstanceConstant'/Tokhdoru/Materials/Brick/MI_Brick_Facade_ulmmccpo_2K.MI_Brick_Facade_ulmmccpo_2K'"));
-        TryLoad(DarkStoneFacadeMaterial, TEXT("MaterialInstanceConstant'/Tokhdoru/Materials/Stone/MI_Via_Lattea_Granite_weoldhcv_4K.MI_Via_Lattea_Granite_weoldhcv_4K'"));
-        TryLoad(LightStoneFacadeMaterial,TEXT("MaterialInstanceConstant'/Tokhdoru/Materials/Stone/MI_Off_White_Tiles_tfihaepg_4K.MI_Off_White_Tiles_tfihaepg_4K'"));
+        // Imported streets-gl materials live under /Tokhdoru/Materials/.
+        TryLoad(BuildingWallMaterial,    TEXT("/Tokhdoru/Materials/M_Building.M_Building"));
+        TryLoad(RoofMaterial,            TEXT("/Tokhdoru/Materials/M_Roof.M_Roof"));
+        TryLoad(RoadMaterial,            TEXT("/Tokhdoru/Materials/M_Road.M_Road"));
+        TryLoad(SidewalkMaterial,        TEXT("/Tokhdoru/Materials/M_Area.M_Area"));
+        TryLoad(WaterMaterial,           TEXT("/Tokhdoru/Materials/M_Water.M_Water"));
+        TryLoad(GroundGrassMaterial,     TEXT("/Tokhdoru/Materials/M_Terrain.M_Terrain"));
+        TryLoad(VegetationMaterial,      TEXT("/Tokhdoru/Materials/M_Area.M_Area"));
+        TryLoad(BuildingGlassMaterial,   TEXT("/Tokhdoru/Materials/M_Glass.M_Glass"));
+        TryLoad(RailwayBallastMaterial,  TEXT("/Tokhdoru/Materials/M_Railway.M_Railway"));
+        TryLoad(RailwayRailMaterial,     TEXT("/Tokhdoru/Materials/M_Railway.M_Railway"));
+
+        // Per-building atlas diagnostics.
+        UE_LOG(LogTemp, Warning,
+                TEXT("Tokhdoru materials | Building=%s Roof=%s Road=%s Area=%s Water=%s Terrain=%s"),
+                BuildingWallMaterial?TEXT("OK"):TEXT("MISSING"),
+                RoofMaterial?TEXT("OK"):TEXT("MISSING"),
+                RoadMaterial?TEXT("OK"):TEXT("MISSING"),
+                SidewalkMaterial?TEXT("OK"):TEXT("MISSING"),
+                WaterMaterial?TEXT("OK"):TEXT("MISSING"),
+                GroundGrassMaterial?TEXT("OK"):TEXT("MISSING"));
 
         if (!TreeMesh)
         {
-                TreeMesh = LoadObject<UStaticMesh>(nullptr, TEXT("StaticMesh'/Tokhdoru/StaticMeshes/Trees/PCG_Tree_02.PCG_Tree_02'"));
+                TreeMesh = LoadObject<UStaticMesh>(nullptr, TEXT("StaticMesh'/Tokhdoru/Models/Trees/PCG_Tree_02.PCG_Tree_02'"));
                 if (TreeMesh && TreeInstancedComp) TreeInstancedComp->SetStaticMesh(TreeMesh);
         }
         if (!GrassMesh)
         {
-                GrassMesh = LoadObject<UStaticMesh>(nullptr, TEXT("StaticMesh'/Tokhdoru/StaticMeshes/Grass/GRASS.GRASS'"));
+                GrassMesh = LoadObject<UStaticMesh>(nullptr, TEXT("StaticMesh'/Tokhdoru/Models/Grass/GRASS.GRASS'"));
                 if (GrassMesh && GrassInstancedComp) GrassInstancedComp->SetStaticMesh(GrassMesh);
         }
 }
@@ -157,7 +199,7 @@ void ATokhdoruActor::LoadDefaultAssets()
 UMaterialInterface* ATokhdoruActor::CreateSolidColorMaterial()
 {
         UMaterialInterface* M = LoadObject<UMaterialInterface>(nullptr,
-                TEXT("Material'/Tokhdoru/Materials/M_SolidColor.M_SolidColor'"));
+                TEXT("Material'/Tokhdoru/Material/M_SolidColor.M_SolidColor'"));
         if (!M)
                 UE_LOG(LogTemp, Warning, TEXT("Tokhdoru: M_SolidColor not found. "
                         "Create: VectorParameter 'Color'→BaseColor, ScalarParameter 'Roughness'=0.7, "
@@ -167,24 +209,26 @@ UMaterialInterface* ATokhdoruActor::CreateSolidColorMaterial()
 
 UMaterialInterface* ATokhdoruActor::CreateVertexColorMaterial()
 {
+        // Plain vertex-colour material that lives in the plugin Content folder.
         UMaterialInterface* M = LoadObject<UMaterialInterface>(nullptr,
-                TEXT("Material'/Tokhdoru/Materials/M_VertexColor.M_VertexColor'"));
+                TEXT("/Tokhdoru/Materials/M_VertexColor.M_VertexColor"));
         if (!M)
                 M = LoadObject<UMaterialInterface>(nullptr,
-                        TEXT("Material'/Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial'"));
+                        TEXT("/Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial"));
         return M;
 }
 
 UMaterialInterface* ATokhdoruActor::CreateGlassMaterial()
 {
         return LoadObject<UMaterialInterface>(nullptr,
-                TEXT("Material'/Tokhdoru/Materials/Glass/Glass.Glass'"));
+                TEXT("Material'/Tokhdoru/Material/Glass/Glass.Glass'"));
 }
 
 UMaterialInstanceDynamic* ATokhdoruActor::CreateColoredMID(UMaterialInterface* ParentMat, FLinearColor Color)
 {
         if (!ParentMat) return nullptr;
-        UMaterialInstanceDynamic* MID = UMaterialInstanceDynamic::Create(ParentMat, this);
+        UMaterialInterface* ResolvedParent = ResolvePBRMaterial(ParentMat);
+        UMaterialInstanceDynamic* MID = UMaterialInstanceDynamic::Create(ResolvedParent, this);
         if (MID)
         {
                 MID->SetVectorParameterValue(FName("Color"),     Color);
@@ -194,100 +238,173 @@ UMaterialInstanceDynamic* ATokhdoruActor::CreateColoredMID(UMaterialInterface* P
 }
 
 // ============================================================================
+// ResolvePBRMaterial — bind streets-gl normal/ORM maps when present
+// ============================================================================
+UMaterialInterface* ATokhdoruActor::ResolvePBRMaterial(UMaterialInterface* BaseMat)
+{
+        if (!bUsePBRMaterials || !BaseMat) return BaseMat;
+
+        UMaterialInstanceDynamic* MID = UMaterialInstanceDynamic::Create(BaseMat, this);
+        if (!MID) return BaseMat;
+
+        auto TryTex = [&](const TCHAR* Param, const TCHAR* Path)
+        {
+                if (UTexture* Tex = LoadObject<UTexture>(nullptr, Path))
+                        MID->SetTextureParameterValue(FName(Param), Tex);
+        };
+
+        // streets-gl building facade PBR (parameter names match imported M_Building).
+        TryTex(TEXT("NormalTexture"),   TEXT("/Tokhdoru/Textures/T_BuildingNormal.T_BuildingNormal"));
+        TryTex(TEXT("NormalMap"),        TEXT("/Tokhdoru/Textures/T_BuildingNormal.T_BuildingNormal"));
+        TryTex(TEXT("RoughnessMap"),     TEXT("/Tokhdoru/Textures/T_BuildingRoughness.T_BuildingRoughness"));
+        TryTex(TEXT("ORMTexture"),       TEXT("/Tokhdoru/Textures/T_BuildingORM.T_BuildingORM"));
+        TryTex(TEXT("MetallicMap"),      TEXT("/Tokhdoru/Textures/T_BuildingORM.T_BuildingORM"));
+
+        return MID;
+}
+
+// ============================================================================
 // ApplyMaterials
 // ============================================================================
 void ATokhdoruActor::ApplyMaterials()
 {
-        static const FLinearColor WallColor       = FLinearColor(FColor(180,170,160));
-        static const FLinearColor RoadColor       = FLinearColor(FColor(60, 60, 60));
-        static const FLinearColor SidewalkColor   = FLinearColor(FColor(180,175,170));
-        static const FLinearColor WaterColor      = FLinearColor(FColor(30, 100,200));
-        static const FLinearColor RoofColor       = FLinearColor(FColor(140, 80, 55));
-        static const FLinearColor VegetationColor = FLinearColor(FColor(50, 140, 40));
-        static const FLinearColor BrickColor      = FLinearColor(FColor(180, 90, 50));
-        static const FLinearColor DarkStoneColor  = FLinearColor(FColor(120,120,115));
-        static const FLinearColor LightStoneColor = FLinearColor(FColor(220,210,195));
-        static const FLinearColor GlassColor      = FLinearColor(FColor(70, 130,200));
+    LoadDefaultAssets();
+    
+    UMaterialInterface* VCMat = CreateVertexColorMaterial();
 
-        UMaterialInterface* SolidMat  = CreateSolidColorMaterial();
-        UMaterialInterface* VCMat     = CreateVertexColorMaterial();
-        UMaterialInterface* GlassMat  = BuildingGlassMaterial ? BuildingGlassMaterial : CreateGlassMaterial();
+    auto Resolve = [&](UMaterialInterface* Override, UMaterialInterface* Textured) -> UMaterialInterface*
+    {
+        if (Override) return Override;
+        if (Textured) return Textured;
+        return VCMat;
+    };
 
-        // Helper: apply to a section; prefers SolidMat MID, then VCMat fallback
-        auto ApplySolid = [&](UProceduralMeshComponent* Comp, int32 Sec,
-                               UMaterialInterface* Preferred, const FLinearColor& FallbackColor)
+    auto ApplyAll = [&](UProceduralMeshComponent* Comp, UMaterialInterface* Mat)
+    {
+        if (!Comp || !Mat) return;
+        const int32 NumSec = Comp->GetNumSections();
+        for (int32 s = 0; s < FMath::Max(1, NumSec); s++)
+            Comp->SetMaterial(s, Mat);
+    };
+
+    UMaterialInterface* BuildingMat = ResolvePBRMaterial(Resolve(WallMaterialOverride, BuildingWallMaterial));
+    UMaterialInterface* RoofMat     = ResolvePBRMaterial(Resolve(RoofMaterialOverride, RoofMaterial));
+    UMaterialInterface* RoadMat     = ResolvePBRMaterial(Resolve(RoadMaterialOverride, RoadMaterial));
+    UMaterialInterface* WaterMat    = Resolve(WaterMaterialOverride, WaterMaterial);
+    UMaterialInterface* GroundMat   = ResolvePBRMaterial(Resolve(GroundMaterialOverride, GroundGrassMaterial));
+    UMaterialInterface* SidewalkMat = ResolvePBRMaterial(Resolve(nullptr, SidewalkMaterial));
+    UMaterialInterface* VegMat      = Resolve(nullptr, VegetationMaterial);
+    UMaterialInterface* RailwayMat    = Resolve(RailwayMaterialOverride, RailwayBallastMaterial);
+    UMaterialInterface* POIMat      = bUseVertexColorMaterial ? VCMat : Resolve(POIMaterialOverride, VCMat);
+
+    // Buildings: Apply base material to all sections first
+    ApplyAll(BuildingMeshComp, BuildingMat);
+
+    // ========================================================================
+    // 3DWindow toggle — manage ALL window-related sections:
+    //   Section 1 = GlassData (3D glass for tall commercial buildings)
+    //   Section 2 = BrickData (facade panels)
+    //   Section 3 = DarkData (facade panels)
+    //   Section 4 = LightData (facade panels)
+    //   Section 5 = ColorWallData (towers/churches - OSM color only)
+    //   Section 6 = WindowData (flat window texture panels)    [b3DWindow=false]
+    //   Section 7 = WindowFrameData (3D window frame bars)     [b3DWindow=true]
+    //   Section 8 = WindowGlassData (3D window glass panes)    [b3DWindow=true]
+    // ========================================================================
+    if (BuildingMeshComp && BuildingMeshComp->GetNumSections() > 1)
+    {
+        // Load M_Glass material for 3D window mode
+        UMaterialInterface* GlassMat = BuildingGlassMaterial
+            ? BuildingGlassMaterial
+            : LoadObject<UMaterialInterface>(nullptr, TEXT("/Tokhdoru/Materials/M_Glass.M_Glass"));
+        UMaterialInterface* FinalGlassMat = GlassMat ? GlassMat : BuildingMat;
+
+        // Section 0: WallData — always building material
+        BuildingMeshComp->SetMaterial(0, BuildingMat);
+
+        // Section 1: Glass curtain-walls (tall commercial buildings)
+        if (BuildingMeshComp->GetNumSections() > 1)
         {
-                if (!Comp) return;
-                if (Preferred)          { Comp->SetMaterial(Sec, Preferred); return; }
-                if (SolidMat)           { Comp->SetMaterial(Sec, CreateColoredMID(SolidMat, FallbackColor)); return; }
-                if (VCMat)              { Comp->SetMaterial(Sec, VCMat); return; }
-        };
+            BuildingMeshComp->SetMaterial(1, FinalGlassMat);
+            BuildingMeshComp->SetMeshSectionVisible(1, true);
+        }
 
-        if (bUseVertexColorMaterial)
+        // Section 2,3,4: Facade panels — always building material
+        for (int32 Sec : {2, 3, 4})
         {
-                // Building sections
-                // 0=Wall  1=Glass  2=Brick  3=DarkStone  4=LightStone
-                ApplySolid(BuildingMeshComp, 0, BuildingWallMaterial, WallColor);
-                if (BuildingMeshComp && BuildingMeshComp->GetNumSections() > 1)
-                        ApplySolid(BuildingMeshComp, 1, GlassMat, GlassColor);
-                if (BuildingMeshComp && BuildingMeshComp->GetNumSections() > 2)
-                        ApplySolid(BuildingMeshComp, 2, BrickFacadeMaterial, BrickColor);
-                if (BuildingMeshComp && BuildingMeshComp->GetNumSections() > 3)
-                        ApplySolid(BuildingMeshComp, 3, DarkStoneFacadeMaterial, DarkStoneColor);
-                if (BuildingMeshComp && BuildingMeshComp->GetNumSections() > 4)
-                        ApplySolid(BuildingMeshComp, 4, LightStoneFacadeMaterial, LightStoneColor);
+            if (BuildingMeshComp->GetNumSections() > Sec)
+            {
+                BuildingMeshComp->SetMaterial(Sec, BuildingMat);
+                BuildingMeshComp->SetMeshSectionVisible(Sec, true);
+            }
+        }
 
-                ApplySolid(RoadMeshComp,       0, RoadMaterial,        RoadColor);
-                ApplySolid(SidewalkMeshComp,   0, SidewalkMaterial,    SidewalkColor);
-                ApplySolid(WaterMeshComp,      0, WaterMaterial,       WaterColor);
-                ApplySolid(GroundMeshComp,     0, GroundGrassMaterial, FLinearColor(FColor(80,140,60)));
-                ApplySolid(VegetationMeshComp, 0, VegetationMaterial,  VegetationColor);
+        // Section 5: Color-only buildings (towers/churches)
+        if (BuildingMeshComp->GetNumSections() > 5)
+        {
+            BuildingMeshComp->SetMaterial(5, BuildingMat);
+            BuildingMeshComp->SetMeshSectionVisible(5, true);
+        }
 
-                // ---- Roof: use per-section MIDs with per-building roof colour ----
-                // RoofMeshComp sections map 1:1 to Buildings array (one section per building).
-                // We apply RoofMaterial globally (it is a texture atlas) OR fall back to
-                // M_SolidColor with the roof colour baked as vertex colour average.
-                // For simplicity (and correct colour-per-building) we apply a single
-                // RoofMaterial to section 0; the vertex colours in the mesh carry per-building
-                // colour that the material can sample.
-                if (RoofMeshComp)
-                {
-                        if (RoofMaterial)
-                                RoofMeshComp->SetMaterial(0, RoofMaterial);
-                        else if (SolidMat)
-                                RoofMeshComp->SetMaterial(0, CreateColoredMID(SolidMat, RoofColor));
-                        else if (VCMat)
-                                RoofMeshComp->SetMaterial(0, VCMat);
-                }
+        if (b3DWindow)
+        {
+            // === 3D WINDOW MODE ===
+            // Section 6: Flat window panels — HIDE
+            if (BuildingMeshComp->GetNumSections() > 6)
+            {
+                BuildingMeshComp->SetMeshSectionVisible(6, false);
+            }
+            // Section 7: 3D window frame bars — SHOW with building material (facade texture)
+            if (BuildingMeshComp->GetNumSections() > 7)
+            {
+                BuildingMeshComp->SetMaterial(7, BuildingMat);
+                BuildingMeshComp->SetMeshSectionVisible(7, true);
+            }
+            // Section 8: 3D window glass panes — SHOW with M_Glass
+            if (BuildingMeshComp->GetNumSections() > 8)
+            {
+                BuildingMeshComp->SetMaterial(8, FinalGlassMat);
+                BuildingMeshComp->SetMeshSectionVisible(8, true);
+            }
         }
         else
         {
-                // Custom materials mode
-                auto TryApply = [&](UProceduralMeshComponent* Comp, int32 Sec, UMaterialInterface* Mat)
-                {
-                        if (!Comp) return;
-                        if (Mat)      { Comp->SetMaterial(Sec, Mat); return; }
-                        if (SolidMat) { Comp->SetMaterial(Sec, SolidMat); return; }
-                        if (VCMat)    { Comp->SetMaterial(Sec, VCMat); }
-                };
-
-                TryApply(BuildingMeshComp,   0, BuildingWallMaterial);
-                if (BuildingMeshComp && BuildingMeshComp->GetNumSections() > 1)
-                        TryApply(BuildingMeshComp, 1, GlassMat);
-                if (BuildingMeshComp && BuildingMeshComp->GetNumSections() > 2)
-                        TryApply(BuildingMeshComp, 2, BrickFacadeMaterial);
-                if (BuildingMeshComp && BuildingMeshComp->GetNumSections() > 3)
-                        TryApply(BuildingMeshComp, 3, DarkStoneFacadeMaterial);
-                if (BuildingMeshComp && BuildingMeshComp->GetNumSections() > 4)
-                        TryApply(BuildingMeshComp, 4, LightStoneFacadeMaterial);
-
-                TryApply(RoadMeshComp,       0, RoadMaterial);
-                TryApply(SidewalkMeshComp,   0, SidewalkMaterial);
-                TryApply(WaterMeshComp,      0, WaterMaterial);
-                TryApply(GroundMeshComp,     0, GroundGrassMaterial);
-                TryApply(RoofMeshComp,       0, RoofMaterial);
-                TryApply(VegetationMeshComp, 0, VegetationMaterial);
+            // === FLAT WINDOW MODE ===
+            // Section 6: Flat window panels — SHOW with building material
+            // (reads WindowSlice from UV1 → TA_BuildingDiffuse atlas window texture)
+            if (BuildingMeshComp->GetNumSections() > 6)
+            {
+                BuildingMeshComp->SetMaterial(6, BuildingMat);
+                BuildingMeshComp->SetMeshSectionVisible(6, true);
+            }
+            // Section 7: 3D window frame bars — HIDE
+            if (BuildingMeshComp->GetNumSections() > 7)
+            {
+                BuildingMeshComp->SetMeshSectionVisible(7, false);
+            }
+            // Section 8: 3D window glass panes — HIDE
+            if (BuildingMeshComp->GetNumSections() > 8)
+            {
+                BuildingMeshComp->SetMeshSectionVisible(8, false);
+            }
         }
+    }
+
+    ApplyAll(RoadMeshComp,     RoadMat);
+    ApplyAll(SidewalkMeshComp, SidewalkMat);
+    ApplyAll(WaterMeshComp,    WaterMat);
+    ApplyAll(GroundMeshComp,   GroundMat);
+    ApplyAll(RoofMeshComp,     RoofMat);
+    ApplyAll(VegetationMeshComp, VegMat);
+
+    if (RailwayMeshComp)
+    {
+        if (RailwayMeshComp->GetNumSections() > 0)
+                RailwayMeshComp->SetMaterial(0, RailwayMat ? RailwayMat : RoadMat);
+        if (RailwayMeshComp->GetNumSections() > 1)
+                RailwayMeshComp->SetMaterial(1, RailwayRailMaterial ? RailwayRailMaterial : RoadMat);
+    }
+    ApplyAll(POIMeshComp, POIMat);
 }
 
 // ============================================================================
@@ -322,6 +439,102 @@ void ATokhdoruActor::RemoveVegetation()
 }
 
 // ============================================================================
+// SpawnModels / RemoveModels - place OSM 3D models (street furniture, power,
+// landmarks) from /Tokhdoru/Models/, one instanced component per model type.
+// ============================================================================
+namespace
+{
+        // Folder name == model type; the StaticMesh asset inside is named after the
+        // folder, except the two statues.
+        FString TokhdoruModelMeshPath(const FString& Type)
+        {
+                FString Mesh = Type;
+                if (Type == TEXT("statue_0"))      Mesh = TEXT("the_thinker");
+                else if (Type == TEXT("statue_1")) Mesh = TEXT("kentaur");
+                return FString::Printf(TEXT("/Tokhdoru/Models/%s/%s.%s"), *Type, *Mesh, *Mesh);
+        }
+}
+
+void ATokhdoruActor::RemoveModels()
+{
+        for (UInstancedStaticMeshComponent* C : ModelInstancedComps)
+                if (C) C->DestroyComponent();
+        ModelInstancedComps.Empty();
+}
+
+void ATokhdoruActor::SpawnModels(const TArray<FGeoModelInstance>& Models, float OX, float OY)
+{
+        RemoveModels();
+        if (Models.Num() == 0) return;
+
+        // One instanced component per model type (cached while iterating).
+        TMap<FString, UInstancedStaticMeshComponent*> ByType;
+
+        int32 Placed = 0;
+        for (const FGeoModelInstance& M : Models)
+        {
+                if (!ByType.Contains(M.ModelType))
+                {
+                        UInstancedStaticMeshComponent* NewISM = nullptr;
+                        UStaticMesh* Mesh = LoadObject<UStaticMesh>(nullptr, *TokhdoruModelMeshPath(M.ModelType));
+                        if (Mesh)
+                        {
+                                NewISM = NewObject<UInstancedStaticMeshComponent>(this);
+                                NewISM->SetupAttachment(RootComponent);
+                                NewISM->SetMobility(EComponentMobility::Movable);
+                                NewISM->RegisterComponent();
+                                NewISM->SetStaticMesh(Mesh);
+                                ModelInstancedComps.Add(NewISM);
+                        }
+                        else
+                        {
+                                UE_LOG(LogTemp, Warning, TEXT("Tokhdoru: model mesh missing: %s"),
+                                        *TokhdoruModelMeshPath(M.ModelType));
+                        }
+                        ByType.Add(M.ModelType, NewISM);
+                }
+
+                UInstancedStaticMeshComponent* ISM = ByType.FindRef(M.ModelType);
+                if (!ISM) continue;
+
+                // Same centre offset + scale as the generated meshes (Y negated).
+                const float WX = (M.Location.X - OX) * ScaleFactor;
+                const float WY = -(M.Location.Y - OY) * ScaleFactor;
+
+                float Yaw;
+                if (M.RotationDeg >= 0.f)
+                {
+                        Yaw = -M.RotationDeg; // OSM bearing -> UE yaw (approx)
+                }
+                else
+                {
+                        // Deterministic pseudo-random yaw from position.
+                        const int32 H = FMath::Abs((int32)(M.Location.X * 13.13f + M.Location.Y * 7.77f));
+                        Yaw = (float)(H % 360);
+                }
+
+                // Most models import already upright (no base correction). A few
+                // lie on their side and need a -90° roll to stand up. The heading
+                // yaw about world Z is then applied on top.
+                const bool bNeedsUpright =
+                        (M.ModelType == TEXT("hydrant") || M.ModelType == TEXT("ad_column"));
+                const FQuat BaseQ = bNeedsUpright
+                        ? FRotator(0.f, 0.f, -90.f).Quaternion()
+                        : FQuat::Identity;
+                const FQuat YawQ(FVector::UpVector, FMath::DegreesToRadians(Yaw));
+                const FTransform Xf(
+                        YawQ * BaseQ,
+                        FVector(WX, WY, GroundOffset),
+                        FVector(ModelScale));
+                ISM->AddInstance(Xf);
+                ++Placed;
+        }
+
+        UE_LOG(LogTemp, Log, TEXT("Tokhdoru: placed %d OSM models across %d type(s)"),
+                Placed, ModelInstancedComps.Num());
+}
+
+// ============================================================================
 // Generate
 // ============================================================================
 void ATokhdoruActor::Generate()
@@ -335,6 +548,10 @@ void ATokhdoruActor::Generate()
         TArray<FGeoWater>      WaterBodies;
         TArray<FGeoPOI>        POIs;
         TArray<FGeoVegetation> Vegetations;
+        TArray<FGeoModelInstance> ModelInstances;
+        TArray<FGeoRailway> Railways;
+        TArray<FGeoTree> Trees;
+        TArray<FElevationSample> ElevationSamples;
 
         if (bUseGeoJSON && !GeoJSONFilePath.IsEmpty())
         {
@@ -344,13 +561,15 @@ void ATokhdoruActor::Generate()
                         UE_LOG(LogTemp, Error, TEXT("Tokhdoru: Failed to load GeoJSON: %s"), *GeoJSONFilePath);
                         return;
                 }
-                Buildings  = Loader.GetBuildings();
-                Roads      = Loader.GetRoads();
-                WaterBodies= Loader.GetWaters();
-                POIs       = Loader.GetPOIs();
-                Vegetations= Loader.GetVegetations();
-                // GeoJSON trees are loaded; vegetation transforms will be generated
-                // by GenerateVegetationTransforms alongside OSM-style vegetation areas.
+                Buildings       = Loader.GetBuildings();
+                Roads           = Loader.GetRoads();
+                WaterBodies     = Loader.GetWaters();
+                POIs            = Loader.GetPOIs();
+                Vegetations     = Loader.GetVegetations();
+                ModelInstances  = Loader.GetModelInstances();
+                Railways        = Loader.GetRailways();
+                Trees           = Loader.GetTrees();
+                ElevationSamples= Loader.GetElevationSamples();
         }
         else if (!OSMFilePath.IsEmpty())
         {
@@ -360,11 +579,15 @@ void ATokhdoruActor::Generate()
                         UE_LOG(LogTemp, Error, TEXT("Tokhdoru: Failed to load OSM: %s"), *OSMFilePath);
                         return;
                 }
-                Buildings  = Loader.GetBuildings();
-                Roads      = Loader.GetRoads();
-                WaterBodies= Loader.GetWaters();
-                POIs       = Loader.GetPOIs();
-                Vegetations= Loader.GetVegetations();
+                Buildings       = Loader.GetBuildings();
+                Roads           = Loader.GetRoads();
+                WaterBodies     = Loader.GetWaters();
+                POIs            = Loader.GetPOIs();
+                Vegetations     = Loader.GetVegetations();
+                ModelInstances  = Loader.GetModelInstances();
+                Railways        = Loader.GetRailways();
+                Trees           = Loader.GetTrees();
+                ElevationSamples= Loader.GetElevationSamples();
         }
         else
         {
@@ -372,8 +595,9 @@ void ATokhdoruActor::Generate()
                 return;
         }
 
-        UE_LOG(LogTemp, Log, TEXT("Tokhdoru: Loaded B=%d R=%d W=%d P=%d V=%d"),
-                Buildings.Num(), Roads.Num(), WaterBodies.Num(), POIs.Num(), Vegetations.Num());
+        UE_LOG(LogTemp, Log, TEXT("Tokhdoru: Loaded B=%d R=%d W=%d P=%d V=%d Rail=%d Trees=%d Ele=%d"),
+                Buildings.Num(), Roads.Num(), WaterBodies.Num(), POIs.Num(), Vegetations.Num(),
+                Railways.Num(), Trees.Num(), ElevationSamples.Num());
 
         // ---------- Centre-offset (double precision) ----------
         double DMinX=DBL_MAX,DMaxX=-DBL_MAX,DMinY=DBL_MAX,DMaxY=-DBL_MAX;
@@ -390,6 +614,11 @@ void ATokhdoruActor::Generate()
                 for (const FVector2D& P : W.Points) ExpandD(P.X, P.Y);
         for (const FGeoVegetation& V : Vegetations)
                 for (const FVector2D& P : V.Points) ExpandD(P.X, P.Y);
+        for (const FGeoRailway& Ry : Railways)
+                for (const FVector2D& P : Ry.Points) ExpandD(P.X, P.Y);
+        for (const FGeoPOI& P : POIs) ExpandD(P.Location.X, P.Location.Y);
+        for (const FGeoTree& T : Trees) ExpandD(T.Location.X, T.Location.Y);
+        for (const FElevationSample& E : ElevationSamples) ExpandD(E.Location.X, E.Location.Y);
 
         float OX=0.f, OY=0.f;
         if (DMinX<DMaxX && DMinY<DMaxY)
@@ -405,6 +634,7 @@ void ATokhdoruActor::Generate()
         for (FGeoBuilding& B : Buildings)
         {
                 ShiftNodes(B.Nodes);
+                for (TArray<FVector2D>& Hole : B.Holes) ShiftNodes(Hole);
                 if (B.Nodes.Num() > 0)
                 {
                         FVector2D S(0,0);
@@ -415,29 +645,57 @@ void ATokhdoruActor::Generate()
         for (FGeoRoad& R : Roads)       ShiftNodes(R.Points);
         for (FGeoWater& W : WaterBodies) ShiftNodes(W.Points);
         for (FGeoVegetation& V : Vegetations) ShiftNodes(V.Points);
+        for (FGeoRailway& Ry : Railways) ShiftNodes(Ry.Points);
+        for (FGeoPOI& P : POIs) { P.Location.X -= OX; P.Location.Y -= OY; }
+        for (FGeoTree& T : Trees) { T.Location.X -= OX; T.Location.Y -= OY; }
+        for (FElevationSample& E : ElevationSamples) { E.Location.X -= OX; E.Location.Y -= OY; }
 
         // ---------- Generate meshes ----------
         FGeoMeshGenerator MeshGen;
         MeshGen.ScaleFactor = ScaleFactor;
 
         // Buildings
-        FGeoMeshGenerator::FMeshData WallData, GlassData, BrickData, DarkData, LightData;
-        MeshGen.GenerateBuildingMeshes(Buildings, WallData, GlassData, BrickData, DarkData, LightData);
+        FGeoMeshGenerator::FMeshData WallData, GlassData, BrickData, DarkData, LightData, ColorWallData, WindowData;
+        FGeoMeshGenerator::FMeshData WindowFrameData, WindowGlassData;
+        MeshGen.GenerateBuildingMeshes(Buildings, WallData, GlassData, BrickData, DarkData, LightData, ColorWallData, WindowData,
+                WindowFrameData, WindowGlassData);
+
+        static const TArray<FVector2D> EmptyUV;
+        static const TArray<FVector> EmptyV3;
+        static const TArray<FColor> EmptyCol;
+        static const TArray<FProcMeshTangent> EmptyTang;
 
         auto CreateSection = [&](UProceduralMeshComponent* Comp, int32 Sec,
                                   FGeoMeshGenerator::FMeshData& D, bool bCollision)
         {
+                // ALWAYS create the section — even with zero vertices — so that
+                // section indices remain contiguous (PMC requires 0..N-1 with no
+                // gaps).  Empty sections are invisible and cost nothing.
                 if (D.Vertices.Num() > 0)
+                {
                         Comp->CreateMeshSection(Sec,
                                 D.Vertices, D.Triangles, D.Normals,
-                                D.UV0, D.VertexColors, D.Tangents, bCollision);
+                                D.UV0, D.UV1, EmptyUV, EmptyUV,
+                                D.VertexColors, D.Tangents, bCollision);
+                }
+                else
+                {
+                        Comp->CreateMeshSection(Sec,
+                                EmptyV3, TArray<int32>(), EmptyV3,
+                                EmptyUV, EmptyUV, EmptyUV, EmptyUV,
+                                EmptyCol, EmptyTang, bCollision);
+                }
         };
 
-        CreateSection(BuildingMeshComp, 0, WallData,  true);
-        CreateSection(BuildingMeshComp, 1, GlassData, false);
-        CreateSection(BuildingMeshComp, 2, BrickData, false);
-        CreateSection(BuildingMeshComp, 3, DarkData,  false);
-        CreateSection(BuildingMeshComp, 4, LightData, false);
+        CreateSection(BuildingMeshComp, 0, WallData,      true);
+        CreateSection(BuildingMeshComp, 1, GlassData,     false);
+        CreateSection(BuildingMeshComp, 2, BrickData,     false);
+        CreateSection(BuildingMeshComp, 3, DarkData,      false);
+        CreateSection(BuildingMeshComp, 4, LightData,     false);
+        CreateSection(BuildingMeshComp, 5, ColorWallData, true);  // tower/church walls (OSM colour)
+        CreateSection(BuildingMeshComp, 6, WindowData,    false); // wall-inset windows (*_Window atlas slice)
+        CreateSection(BuildingMeshComp, 7, WindowFrameData, false); // 3D window frame bars
+        CreateSection(BuildingMeshComp, 8, WindowGlassData, false); // 3D window glass panes
 
         // Roads
         FGeoMeshGenerator::FMeshData RoadData, SWData;
@@ -450,15 +708,34 @@ void ATokhdoruActor::Generate()
         MeshGen.GenerateWaterMeshes(WaterBodies, WaterData);
         CreateSection(WaterMeshComp, 0, WaterData, false);
 
-        // Ground
+        // Ground (flat or terrain-deformed from ele / GeoJSON Z)
         FGeoMeshGenerator::FMeshData GroundData;
-        MeshGen.GenerateGroundMesh(Buildings, Roads, WaterBodies, Vegetations, GroundData, GroundOffset);
+        MeshGen.GenerateGroundMesh(Buildings, Roads, WaterBodies, Vegetations,
+                ElevationSamples, GroundData, GroundOffset, bUseTerrainElevation, TerrainGridSubdivisions);
         CreateSection(GroundMeshComp, 0, GroundData, true);
 
-        // Roofs  ← now with shaped geometry + per-building colour
-        FGeoMeshGenerator::FMeshData RoofData;
-        MeshGen.GenerateRoofMeshes(Buildings, RoofData);
-        CreateSection(RoofMeshComp, 0, RoofData, false);
+        // Railways
+        if (bShowRailways)
+        {
+                FGeoMeshGenerator::FMeshData BallastData, RailStripData;
+                MeshGen.GenerateRailwayMeshes(Railways, BallastData, RailStripData);
+                CreateSection(RailwayMeshComp, 0, BallastData, false);
+                CreateSection(RailwayMeshComp, 1, RailStripData, false);
+        }
+
+        // POI markers
+        FGeoMeshGenerator::FMeshData POIData;
+        if (bShowPOIMarkers)
+        {
+                MeshGen.GeneratePOIMarkers(POIs, POIData, POIMarkerRadius, POIMarkerHeight);
+                CreateSection(POIMeshComp, 0, POIData, false);
+        }
+
+        // Roofs  ← flat roofs (atlas) in section 0, shaped/landmark roofs (OSM colour) in section 1
+        FGeoMeshGenerator::FMeshData RoofData, RoofColorData;
+        MeshGen.GenerateRoofMeshes(Buildings, RoofData, RoofColorData);
+        CreateSection(RoofMeshComp, 0, RoofData,      false);
+        CreateSection(RoofMeshComp, 1, RoofColorData, false);
 
         // Vegetation
         FGeoMeshGenerator::FMeshData VegData;
@@ -472,21 +749,26 @@ void ATokhdoruActor::Generate()
         auto UpdateB = [](UProceduralMeshComponent* C) { if (C) C->UpdateBounds(); };
         UpdateB(BuildingMeshComp); UpdateB(RoadMeshComp); UpdateB(SidewalkMeshComp);
         UpdateB(WaterMeshComp);    UpdateB(GroundMeshComp); UpdateB(RoofMeshComp);
-        UpdateB(VegetationMeshComp);
+        UpdateB(VegetationMeshComp); UpdateB(RailwayMeshComp); UpdateB(POIMeshComp);
 
         // ---------- Vegetation instances ----------
         TArray<FTransform> TreeXf, GrassXf;
         MeshGen.GenerateVegetationTransforms(Vegetations, Buildings, Roads,
                 TreeXf, GrassXf, TreeDensityScale, GrassDensityScale);
+        FGeoMeshGenerator::AppendOSMTreeTransforms(Trees, TreeXf, ScaleFactor, GroundOffset);
         SpawnVegetation(TreeXf, GrassXf);
+
+        // ---------- OSM 3D models (hydrants, benches, towers, statues, …) ----------
+        SpawnModels(ModelInstances, OX, OY);
+        UE_LOG(LogTemp, Log, TEXT("  Models=%d"), ModelInstances.Num());
 
         // ---------- Log summary ----------
         UE_LOG(LogTemp, Log, TEXT("Tokhdoru: Done. ScaleFactor=%.0f  Centre(%.1f, %.1f)m"), ScaleFactor, OX, OY);
-        UE_LOG(LogTemp, Log, TEXT("  Verts: Wall=%d Glass=%d Road=%d SW=%d Water=%d Ground=%d Roof=%d Veg=%d"),
+        UE_LOG(LogTemp, Log, TEXT("  Verts: Wall=%d Glass=%d Road=%d SW=%d Water=%d Ground=%d Roof=%d Veg=%d POI=%d"),
                 WallData.Vertices.Num(), GlassData.Vertices.Num(),
                 RoadData.Vertices.Num(), SWData.Vertices.Num(),
                 WaterData.Vertices.Num(), GroundData.Vertices.Num(),
-                RoofData.Vertices.Num(), VegData.Vertices.Num());
+                RoofData.Vertices.Num(), VegData.Vertices.Num(), POIData.Vertices.Num());
         UE_LOG(LogTemp, Log, TEXT("  Trees=%d  Grass=%d"), TreeXf.Num(), GrassXf.Num());
 
         // Log building:part count for debugging
@@ -521,5 +803,8 @@ void ATokhdoruActor::Clear()
         if (GroundMeshComp)     GroundMeshComp->ClearAllMeshSections();
         if (RoofMeshComp)       RoofMeshComp->ClearAllMeshSections();
         if (VegetationMeshComp) VegetationMeshComp->ClearAllMeshSections();
+        if (RailwayMeshComp)    RailwayMeshComp->ClearAllMeshSections();
+        if (POIMeshComp)        POIMeshComp->ClearAllMeshSections();
         RemoveVegetation();
+        RemoveModels();
 }

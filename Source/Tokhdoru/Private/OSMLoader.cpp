@@ -34,14 +34,16 @@ bool FOSMLoader::LoadOSMFromString(const FString& OSMContent)
 {
         Buildings.Empty(); Roads.Empty(); Waters.Empty();
         Vegetations.Empty(); POIs.Empty(); Trees.Empty(); Railways.Empty();
+        ModelInstances.Empty(); ElevationSamples.Empty();
+        ModelInstances.Empty();
         NodeCoords.Empty(); NodeRawCoords.Empty(); NodeTags.Empty(); WayMap.Empty();
         MinLat = DBL_MAX; MaxLat = -DBL_MAX; MinLon = DBL_MAX; MaxLon = -DBL_MAX;
 
-        // FXmlFile construction: try without explicit EXmlFileStyle for
-        // compatibility across UE5 versions. The constructor's second parameter
-        // defaults to ContentOnly. If that fails, our OSMLoader.h provides
-        // a fallback EXmlFileStyle definition.
-        FXmlFile XmlDocument(OSMContent, EConstructMethod::ConstructOnly);
+        // FXmlFile construction from an in-memory string buffer.
+        // EConstructMethod has only two members in UE5: ConstructFromFile and
+        // ConstructFromBuffer. Since OSMContent is the XML text (not a path),
+        // we must use ConstructFromBuffer.
+        FXmlFile XmlDocument(OSMContent, EConstructMethod::ConstructFromBuffer);
         if (!XmlDocument.IsValid())
         {
                 UE_LOG(LogTemp, Error, TEXT("OSMLoader: Failed to parse OSM XML"));
@@ -105,6 +107,16 @@ void FOSMLoader::ParseNodes(const FXmlNode* RootNode)
                 if (Tags.Num() > 0)
                 {
                         NodeTags.Add(NodeId, Tags);
+
+                        // OSM ele tag — used for terrain deformation (streets.gl terrain parity).
+                        const FString* EleStr = Tags.Find(TEXT("ele"));
+                        if (EleStr && EleStr->IsNumeric())
+                        {
+                                FElevationSample Sample;
+                                Sample.RawLonLat = FDoublePoint2D(Lon, Lat);
+                                Sample.Elevation = FCString::Atod(**EleStr);
+                                ElevationSamples.Add(Sample);
+                        }
                 }
         }
 }
@@ -141,8 +153,17 @@ void FOSMLoader::ParseWays(const FXmlNode* RootNode)
 
                 if (NodeRefs.Num() < 2) continue;
 
-                // Determine what kind of feature this way represents
-                bool bHasBuildingTag = Tags.Contains(TEXT("building"));
+                // Determine what kind of feature this way represents.
+                // building=no/construction/proposed are NOT real buildings: they must
+                // not be extruded (e.g. an "Alte Akademie" construction site that
+                // streets.gl keeps flat). Such ways fall through to nothing.
+                bool bHasBuildingTag = false;
+                if (Tags.Contains(TEXT("building")))
+                {
+                        const FString BV = Tags[TEXT("building")].ToLower();
+                        bHasBuildingTag = (BV != TEXT("no") && BV != TEXT("construction") &&
+                                BV != TEXT("proposed") && BV != TEXT("demolished"));
+                }
                 bool bHasHighwayTag = Tags.Contains(TEXT("highway"));
                 bool bHasRailwayTag = Tags.Contains(TEXT("railway"));
                 bool bHasWaterTag = Tags.Contains(TEXT("water")) || Tags.Contains(TEXT("waterway"));
@@ -156,7 +177,12 @@ void FOSMLoader::ParseWays(const FXmlNode* RootNode)
                         FString Landuse = Tags[TEXT("landuse")];
                         if (Landuse == TEXT("grass") || Landuse == TEXT("forest") || Landuse == TEXT("orchard")
                                 || Landuse == TEXT("vineyard") || Landuse == TEXT("meadow") || Landuse == TEXT("flowerbed")
-                                || Landuse == TEXT("shrubs"))
+                                || Landuse == TEXT("shrubs")
+                                // Bare ground surfaces — rendered as a flat AREA (brown, no
+                                // grass/trees scattered) so a construction site reads as a
+                                // dirt lot instead of a green field (e.g. Baufeld Marienhof).
+                                || Landuse == TEXT("construction") || Landuse == TEXT("brownfield")
+                                || Landuse == TEXT("landfill"))
                                 bIsVegetation = true;
                 }
                 if (!bIsVegetation && Tags.Contains(TEXT("leisure")))
@@ -228,6 +254,82 @@ void FOSMLoader::ParseWays(const FXmlNode* RootNode)
                         continue;
                 }
 
+                // 3D model instances (street furniture, power, landmarks).
+                // Mirrors streets-gl's OSMNodeQualifierFactory node->model mapping.
+                {
+                        auto Is = [&](const TCHAR* K, const TCHAR* V) -> bool
+                        { const FString* P = Tags.Find(K); return P && (*P == V); };
+                        auto ParseDir = [](const FString& S) -> float
+                        {
+                                if (S.IsNumeric()) return FCString::Atof(*S);
+                                const FString U = S.ToUpper();
+                                if (U == TEXT("N"))  return 0.f;   if (U == TEXT("NE")) return 45.f;
+                                if (U == TEXT("E"))  return 90.f;  if (U == TEXT("SE")) return 135.f;
+                                if (U == TEXT("S"))  return 180.f; if (U == TEXT("SW")) return 225.f;
+                                if (U == TEXT("W"))  return 270.f; if (U == TEXT("NW")) return 315.f;
+                                return -1.f;
+                        };
+
+                        FString ModelType;
+                        float RotDeg = -1.f, Hgt = 0.f;
+
+                        if (Is(TEXT("emergency"), TEXT("fire_hydrant")))
+                        {
+                                const FString* HT = Tags.Find(TEXT("fire_hydrant:type"));
+                                if (!HT || *HT == TEXT("pillar")) ModelType = TEXT("hydrant");
+                        }
+                        else if (Is(TEXT("advertising"), TEXT("column"))) ModelType = TEXT("ad_column");
+                        // Construction tower cranes (man_made=crane, usually crane:type=tower_crane).
+                        else if (Is(TEXT("man_made"), TEXT("crane")))     ModelType = TEXT("tower_crane");
+                        else if (Is(TEXT("power"), TEXT("tower")))        ModelType = TEXT("transmission_tower");
+                        else if (Is(TEXT("power"), TEXT("pole")))         ModelType = TEXT("utility_pole");
+                        else if (Is(TEXT("amenity"), TEXT("bench")))
+                        {
+                                ModelType = TEXT("bench");
+                                const FString* Dir = Tags.Find(TEXT("direction"));
+                                if (Dir) RotDeg = ParseDir(*Dir);
+                        }
+                        else if (Is(TEXT("leisure"), TEXT("picnic_table"))) ModelType = TEXT("picnic_table");
+                        else if (Is(TEXT("highway"), TEXT("bus_stop")))     ModelType = TEXT("bus_stop");
+                        else if (Is(TEXT("power"), TEXT("generator")) && Is(TEXT("generator:source"), TEXT("wind")))
+                        {
+                                ModelType = TEXT("wind_turbine");
+                                const FString* H = Tags.Find(TEXT("height"));
+                                if (H) Hgt = FCString::Atof(**H);
+                        }
+                        else if (Is(TEXT("historic"), TEXT("memorial")))
+                        {
+                                const FString* M = Tags.Find(TEXT("memorial"));
+                                const FString MV = M ? M->ToLower() : FString();
+                                if (MV.Contains(TEXT("statue")))         ModelType = TEXT("statue_0");
+                                else if (MV.Contains(TEXT("sculpture"))) ModelType = TEXT("sculpture");
+                                else                                     ModelType = TEXT("memorial");
+                        }
+                        else if (Is(TEXT("tourism"), TEXT("artwork")))
+                        {
+                                const FString* A = Tags.Find(TEXT("artwork_type"));
+                                const FString AV = A ? A->ToLower() : FString();
+                                if (AV.Contains(TEXT("statue")))         ModelType = TEXT("statue_1");
+                                else if (AV.Contains(TEXT("sculpture"))) ModelType = TEXT("sculpture");
+                        }
+
+                        if (!ModelType.IsEmpty())
+                        {
+                                const FDoublePoint2D* RawCoord = NodeRawCoords.Find(NodeId);
+                                if (RawCoord)
+                                {
+                                        FGeoModelInstance MI;
+                                        MI.RawLonLat = *RawCoord;
+                                        MI.Location = FVector2D((float)RawCoord->X, (float)RawCoord->Y);
+                                        MI.ModelType = ModelType;
+                                        MI.RotationDeg = RotDeg;
+                                        MI.Height = Hgt;
+                                        ModelInstances.Add(MI);
+                                }
+                                continue; // handled as a model; don't also add as a generic POI
+                        }
+                }
+
                 // Other POIs
                 if (Tags.Contains(TEXT("amenity")) || Tags.Contains(TEXT("shop")) ||
                         Tags.Contains(TEXT("tourism")) || Tags.Contains(TEXT("office")) ||
@@ -263,8 +365,16 @@ void FOSMLoader::ParseRelations(const FXmlNode* RootNode)
                 TMap<FString, FString> Tags = ExtractTags(Child);
                 if (Tags.Num() == 0) continue;
 
-                // Check if this is a building relation
-                bool bIsBuildingRelation = Tags.Contains(TEXT("building")) ||
+                // Check if this is a building relation (excluding non-building
+                // building=no/construction/proposed, same as the way path).
+                bool bBuildingVal = false;
+                if (Tags.Contains(TEXT("building")))
+                {
+                        const FString BV = Tags[TEXT("building")].ToLower();
+                        bBuildingVal = (BV != TEXT("no") && BV != TEXT("construction") &&
+                                BV != TEXT("proposed") && BV != TEXT("demolished"));
+                }
+                bool bIsBuildingRelation = bBuildingVal ||
                         (Tags.Contains(TEXT("type")) && Tags[TEXT("type")] == TEXT("building"));
 
                 if (!bIsBuildingRelation) continue;
@@ -313,6 +423,22 @@ void FOSMLoader::ParseRelations(const FXmlNode* RootNode)
                                 FGeoBuilding Building;
                                 Building.Nodes = AllNodes;
                                 Building.RawLonLat = AllRawNodes;
+
+                                // Resolve inner rings (courtyards / holes).
+                                for (int64 InnerId : InnerWayIds)
+                                {
+                                        FOSMWay* IW = WayMap.Find(InnerId);
+                                        if (!IW) continue;
+                                        TArray<FVector2D> HP;
+                                        TArray<FDoublePoint2D> HRP;
+                                        if (ResolveNodeRefs(IW->NodeRefs, HP, HRP))
+                                        {
+                                                if (HRP.Num() > 1 && HRP[0].X == HRP.Last().X && HRP[0].Y == HRP.Last().Y)
+                                                        HRP.Pop();
+                                                if (HRP.Num() >= 3)
+                                                        Building.HolesRaw.Add(HRP);
+                                        }
+                                }
 
                                 // Calculate center
                                 float CX = 0.f, CY = 0.f;
@@ -365,6 +491,11 @@ void FOSMLoader::ProcessBuildingWay(const FXmlNode* WayNode)
         {
                 Building.bIsBuildingPart = true;
                 Building.BuildingPartId = WayNode->GetAttribute(TEXT("id"));
+                // building:part=tower is a free-standing tower (e.g. Alter Peter), NOT a
+                // small roof turret. Towers must never have their column dropped to a
+                // neighbour's eave nor their skillion cap stretched toward an adjacent dome.
+                if (Tags[TEXT("building:part")].ToLower() == TEXT("tower"))
+                        Building.bIsTowerPart = true;
         }
 
         // Calculate center
@@ -514,6 +645,9 @@ void FOSMLoader::ProcessVegetationWay(const FXmlNode* WayNode)
                 if (Landuse == TEXT("forest")) Veg.Color = FLinearColor(0.1f, 0.4f, 0.1f, 1.f);
                 else if (Landuse == TEXT("grass") || Landuse == TEXT("meadow")) Veg.Color = FLinearColor(0.25f, 0.6f, 0.2f, 1.f);
                 else if (Landuse == TEXT("flowerbed")) Veg.Color = FLinearColor(0.6f, 0.4f, 0.3f, 1.f);
+                // Bare construction/brownfield/landfill ground: dirt brown, no greenery.
+                else if (Landuse == TEXT("construction") || Landuse == TEXT("brownfield") || Landuse == TEXT("landfill"))
+                        Veg.Color = FLinearColor(0.42f, 0.33f, 0.24f, 1.f);
                 else Veg.Color = FLinearColor(0.2f, 0.55f, 0.15f, 1.f);
         }
         else if (Tags.Contains(TEXT("leisure")))
@@ -553,6 +687,15 @@ void FOSMLoader::ApplyBuildingTags(FGeoBuilding& Building, const TMap<FString, F
                         Building.BuildingType = 3;
         }
 
+        // Places of worship are frequently tagged building=yes + amenity=place_of_worship
+        // (e.g. "Sankt Michael"), so the building= value alone misses them. Fold the
+        // amenity/religion hint into the type string so IsColorOnlyBuilding treats them
+        // as colour-only landmarks (and they never pull the generic 00-03 roof slices).
+        if (Tags.Contains(TEXT("amenity")) && Tags[TEXT("amenity")].ToLower() == TEXT("place_of_worship"))
+                Building.BuildingTypeStr += TEXT(" place_of_worship");
+        if (Tags.Contains(TEXT("religion")))
+                Building.BuildingTypeStr += TEXT(" religious");
+
         // Name
         if (Tags.Contains(TEXT("name"))) Building.Name = Tags[TEXT("name")];
 
@@ -564,13 +707,23 @@ void FOSMLoader::ApplyBuildingTags(FGeoBuilding& Building, const TMap<FString, F
         if (Tags.Contains(TEXT("building:levels")))
                 Building.Levels = FCString::Atoi(*Tags[TEXT("building:levels")]);
 
-        // Default height from levels
-        if (Building.Height <= 0.0 && Building.Levels > 0)
-                Building.Height = Building.Levels * 3.5;
-
-        // Min height
+        // Min height — must be parsed before the level-based height estimate so that
+        // building:parts with only building:levels get the correct absolute top height.
         if (Tags.Contains(TEXT("min_height")))
                 Building.MinHeight = FCString::Atod(*Tags[TEXT("min_height")]);
+
+        // Default height from levels.
+        // For building:parts the OSM 'height' tag is the ABSOLUTE top from ground level.
+        // When only building:levels is present, estimate the absolute top as
+        // min_height + levels * floor_height so elevated parts (towers, etc.) render
+        // at the correct altitude instead of starting from ground.
+        if (Building.Height <= 0.0 && Building.Levels > 0)
+        {
+                if (Building.bIsBuildingPart && Building.MinHeight > 0.0)
+                        Building.Height = Building.MinHeight + Building.Levels * 3.5;
+                else
+                        Building.Height = Building.Levels * 3.5;
+        }
 
         // Min level
         if (Tags.Contains(TEXT("building:min_level")))
@@ -640,8 +793,23 @@ void FOSMLoader::ApplyBuildingTags(FGeoBuilding& Building, const TMap<FString, F
                 Building.RoofHeight = HalfWidth * FMath::Tan(FMath::DegreesToRadians((float)Building.RoofAngle));
         }
 
-        // Default roof height for non-flat roofs
-        if (Building.RoofHeight <= 0.0 && Building.RoofShape != ERoofShape::Flat)
+        // Default roof height for non-flat roofs.
+        // Onion, Dome and Round are intentionally LEFT at 0 here. Their rise is
+        // derived from the footprint width inside GeoMeshGenerator (where the
+        // geometry is already in local units — at this parse stage Building.Nodes
+        // are still raw lat/lon degrees, so a width-based calc here would be wrong).
+        // A flat 3 m default also marks roof:height as explicit downstream, which
+        // would block that width-proportional sizing.
+        // Gambrel and Mansard are also LEFT at 0: they carry roof:levels which
+        // GeoMeshGenerator converts to height (levels*300 UU). Forcing 3 m here
+        // sets bRoofHeightExplicit=true and causes the roof:levels branch to be
+        // skipped, producing a squashed gambrel on top of lowered walls.
+        if (Building.RoofHeight <= 0.0 && Building.RoofShape != ERoofShape::Flat
+                && Building.RoofShape != ERoofShape::Onion
+                && Building.RoofShape != ERoofShape::Dome
+                && Building.RoofShape != ERoofShape::Round
+                && Building.RoofShape != ERoofShape::Gambrel
+                && Building.RoofShape != ERoofShape::Mansard)
                 Building.RoofHeight = 3.0;
 }
 
@@ -667,7 +835,12 @@ void FOSMLoader::ApplyRoadTags(FGeoRoad& Road, const TMap<FString, FString>& Tag
                 else if (HW == TEXT("residential"))     Road.Width = 8.0f;
                 else if (HW == TEXT("service"))         Road.Width = 5.0f;
                 else if (HW == TEXT("living_street"))   Road.Width = 6.0f;
-                else if (HW == TEXT("pedestrian"))      Road.Width = 10.0f;
+                else if (HW == TEXT("pedestrian"))      Road.Width = 6.0f;
+                else if (HW == TEXT("footway"))         Road.Width = 2.0f;
+                else if (HW == TEXT("path"))            Road.Width = 1.5f;
+                else if (HW == TEXT("cycleway"))        Road.Width = 2.0f;
+                else if (HW == TEXT("steps"))           Road.Width = 2.0f;
+                else if (HW == TEXT("track"))           Road.Width = 3.0f;
                 else                                    Road.Width = 8.0f;
 
                 Road.bIsHighway = (HW == TEXT("motorway") || HW == TEXT("trunk") ||
@@ -733,6 +906,18 @@ void FOSMLoader::ConvertAllCoordsToLocal()
                         for (const FVector2D& N : B.Nodes) { CX += N.X; CY += N.Y; }
                         B.Center = FVector2D(CX / B.Nodes.Num(), CY / B.Nodes.Num());
                 }
+
+                // Convert inner rings (courtyards / holes) to local meters.
+                B.Holes.Empty();
+                for (const TArray<FDoublePoint2D>& HRaw : B.HolesRaw)
+                {
+                        TArray<FVector2D> H;
+                        H.Reserve(HRaw.Num());
+                        for (const FDoublePoint2D& RL : HRaw)
+                                H.Add(LatLonToLocal(RL.Y, RL.X));
+                        if (H.Num() >= 3)
+                                B.Holes.Add(H);
+                }
         }
 
         // Roads
@@ -780,6 +965,12 @@ void FOSMLoader::ConvertAllCoordsToLocal()
                 T.Location = LatLonToLocal(T.RawLonLat.Y, T.RawLonLat.X);
         }
 
+        // Model instances (street furniture, power, landmarks)
+        for (FGeoModelInstance& M : ModelInstances)
+        {
+                M.Location = LatLonToLocal(M.RawLonLat.Y, M.RawLonLat.X);
+        }
+
         // Railways
         for (FGeoRailway& R : Railways)
         {
@@ -790,6 +981,12 @@ void FOSMLoader::ConvertAllCoordsToLocal()
                                 R.Points.Add(LatLonToLocal(RL.Y, RL.X));
                 }
         }
+
+        // Elevation samples (OSM ele nodes)
+        for (FElevationSample& E : ElevationSamples)
+        {
+                E.Location = LatLonToLocal(E.RawLonLat.Y, E.RawLonLat.X);
+        }
 }
 
 // ============================================================================
@@ -797,23 +994,92 @@ void FOSMLoader::ConvertAllCoordsToLocal()
 // ============================================================================
 void FOSMLoader::AssembleBuildingParts()
 {
-        // Simple approach: for now, building:parts are already added as individual
-        // FGeoBuilding entries with bIsBuildingPart=true. The mesh generator
-        // handles them as separate meshes stacked on the same footprint area.
-        // Future improvement: merge overlapping parts and resolve Z-ordering.
-        //
-        // This is where you would implement proper building:part assembly:
-        // 1. Group parts by their parent relation
-        // 2. For each group, determine the outline
-        // 3. Stack parts vertically based on min_height/max_height
-        // 4. Generate merged building with multiple vertical sections
+        // Ray-casting point-in-polygon. Works in any consistent 2D coord system,
+        // so it is safe to call here (before WGS84->local conversion) because the
+        // outline polygon and the part centroid are in the SAME system.
+        auto PointInPoly = [](const FVector2D& P, const TArray<FVector2D>& Poly) -> bool
+        {
+                bool bInside = false;
+                const int32 N = Poly.Num();
+                for (int32 i = 0, j = N - 1; i < N; j = i++)
+                {
+                        const FVector2D& A = Poly[i];
+                        const FVector2D& B = Poly[j];
+                        if (((A.Y > P.Y) != (B.Y > P.Y)) &&
+                                (P.X < (B.X - A.X) * (P.Y - A.Y) / (B.Y - A.Y) + A.X))
+                                bInside = !bInside;
+                }
+                return bInside;
+        };
 
-        int32 PartCount = 0;
+        int32 PartCount = 0, SuppressCount = 0;
         for (const FGeoBuilding& B : Buildings)
                 if (B.bIsBuildingPart) PartCount++;
 
+        // Simple 3D Buildings rule (what streets.gl does): when a building outline
+        // is covered by building:part polygons, the OUTLINE itself must NOT be
+        // rendered in 3D — only the parts define the geometry. Otherwise the
+        // outline's walls+roof (often a flat roof at a different height) sit on top
+        // of the detailed parts and ruin the result (e.g. the flat slab that was
+        // covering the Frauenkirche nave + towers).
+        //
+        // Detect such outlines by testing whether any part's centroid lies inside
+        // them. (Parts are usually smaller than, and contained by, their outline.)
         if (PartCount > 0)
-                UE_LOG(LogTemp, Log, TEXT("OSMLoader: %d building:parts loaded (rendered as separate meshes)"), PartCount);
+        {
+                for (FGeoBuilding& Outline : Buildings)
+                {
+                        if (Outline.bIsBuildingPart) continue;
+                        if (Outline.Nodes.Num() < 3) continue;
+
+                        for (const FGeoBuilding& Part : Buildings)
+                        {
+                                if (!Part.bIsBuildingPart) continue;
+                                if (&Part == &Outline) continue;
+                                if (PointInPoly(Part.Center, Outline.Nodes))
+                                {
+                                        Outline.bSuppressOutline = true;
+                                        SuppressCount++;
+                                        break;
+                                }
+                        }
+                }
+        }
+
+        // Suppress flat roofs of building:parts that have another part sitting directly
+        // on top (its min_height ≈ this part's height AND its centroid is inside this
+        // part's footprint). This eliminates the "phantom plane" visible between towers
+        // and the nave of a church where the nave's flat cap bleeds through.
+        int32 RoofSuppressCount = 0;
+        for (FGeoBuilding& Base : Buildings)
+        {
+                if (!Base.bIsBuildingPart) continue;
+                if (Base.bSuppressOutline) continue;
+                if (Base.Height <= 0.0) continue;
+                // Only FLAT caps create the "phantom plane" this pass removes. A part
+                // carrying a real roof shape (onion, dome, gabled, ...) is a genuine
+                // feature — e.g. an onion dome sitting under a finial/cross part — and
+                // must never be suppressed, or it vanishes from the scene.
+                if (Base.RoofShape != ERoofShape::Flat) continue;
+
+                for (const FGeoBuilding& Upper : Buildings)
+                {
+                        if (!Upper.bIsBuildingPart) continue;
+                        if (&Upper == &Base) continue;
+                        // Upper part starts approximately where Base ends (within 0.5 m).
+                        if (FMath::Abs((float)(Upper.MinHeight - Base.Height)) > 0.5f) continue;
+                        if (PointInPoly(Upper.Center, Base.Nodes))
+                        {
+                                Base.bSuppressRoof = true;
+                                RoofSuppressCount++;
+                                break;
+                        }
+                }
+        }
+
+        UE_LOG(LogTemp, Log,
+                TEXT("OSMLoader: %d building:parts; %d outline(s) suppressed; %d part roof(s) suppressed (covered by upper parts)"),
+                PartCount, SuppressCount, RoofSuppressCount);
 }
 
 // ============================================================================

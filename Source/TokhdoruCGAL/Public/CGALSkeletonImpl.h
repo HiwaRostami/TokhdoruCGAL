@@ -45,11 +45,21 @@ struct CGALSkeletonEdge
     int IsBisector;  // 1 = interior bisector edge, 0 = boundary edge
 };
 
-/** Complete straight skeleton result with vertices and edges. */
+/** A face of the straight skeleton. Each face corresponds to exactly ONE
+ *  input contour (footprint) edge, and is the sloped roof panel rising from
+ *  that edge up to the skeleton ridge. VertexIndices lists the face boundary
+ *  vertices (indices into CGALSkeletonResult.Vertices) in order. */
+struct CGALSkeletonFace
+{
+    std::vector<int> VertexIndices;
+};
+
+/** Complete straight skeleton result with vertices, edges and faces. */
 struct CGALSkeletonResult
 {
     std::vector<CGALSkeletonVertex> Vertices;
     std::vector<CGALSkeletonEdge>   Edges;
+    std::vector<CGALSkeletonFace>   Faces;
     double MaxTime;
 
     CGALSkeletonResult() : MaxTime(0.0) {}
@@ -83,6 +93,13 @@ struct CGALTriangulationResult
 CGALBRIDGE_API CGALSkeletonResult CGAL_GenerateSkeleton(
     const std::vector<double>& PolygonPoints);
 
+/** Straight skeleton of a polygon WITH HOLES (inner courtyards).
+ *  @param OuterPoints  Outer ring [X0,Y0, ...]
+ *  @param Holes        Each inner ring as a flat [X0,Y0, ...] array */
+CGALBRIDGE_API CGALSkeletonResult CGAL_GenerateSkeletonWithHoles(
+    const std::vector<double>& OuterPoints,
+    const std::vector<std::vector<double>>& Holes);
+
 /** Legacy method: Generate skeleton edges as position pairs (no time data). */
 CGALBRIDGE_API std::vector<CGALSkeletonEdgePair> CGAL_GenerateSkeletonEdges(
     const std::vector<double>& PolygonPoints);
@@ -92,3 +109,10 @@ CGALBRIDGE_API std::vector<CGALSkeletonEdgePair> CGAL_GenerateSkeletonEdges(
  *  @return               Triangulation result with triangles + optional Steiner points */
 CGALBRIDGE_API CGALTriangulationResult CGAL_Triangulate(
     const std::vector<double>& PolygonPoints);
+
+/** Triangulate a 2D polygon WITH HOLES (courtyards excluded via nesting depth).
+ *  @param OuterPoints  Outer ring [X0,Y0, ...]
+ *  @param Holes        Each inner ring as a flat [X0,Y0, ...] array */
+CGALBRIDGE_API CGALTriangulationResult CGAL_TriangulateWithHoles(
+    const std::vector<double>& OuterPoints,
+    const std::vector<std::vector<double>>& Holes);

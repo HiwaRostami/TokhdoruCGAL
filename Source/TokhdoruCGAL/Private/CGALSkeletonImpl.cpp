@@ -67,6 +67,7 @@
 #include <CGAL/Polygon_2.h>
 #include <CGAL/Polygon_with_holes_2.h>
 #include <CGAL/create_straight_skeleton_2.h>
+#include <CGAL/create_straight_skeleton_from_polygon_with_holes_2.h>
 #include <CGAL/Straight_skeleton_2.h>
 #include <CGAL/Straight_skeleton_face_base_2.h>
 #include <CGAL/Straight_skeleton_vertex_base_2.h>
@@ -103,11 +104,17 @@ typedef CGAL::Polygon_2<K>       Polygon_2;
 typedef CGAL::Straight_skeleton_2<K>  Skeleton_2;
 typedef std::shared_ptr<Skeleton_2>   SkeletonPtr;
 
-// CDT types with face info (for inside/outside marking)
+typedef CGAL::Polygon_with_holes_2<K> Polygon_with_holes_2;
+
+// CDT face info stores the polygon "nesting level" (distance in constrained-edge
+// crossings from the infinite face). Odd nesting = inside the polygon; even
+// nesting (0 outside, 2 = inside a hole, ...) = outside. This is the standard
+// CGAL "mark domains" approach and handles polygons WITH HOLES correctly.
 struct FaceInfo
 {
-    bool bIsInside;
-    FaceInfo() : bIsInside(false) {}
+    int Nesting;
+    FaceInfo() : Nesting(-1) {}
+    bool IsInside() const { return Nesting >= 0 && (Nesting % 2) == 1; }
 };
 
 typedef CGAL::Triangulation_vertex_base_2<K>                           VB;
@@ -119,20 +126,16 @@ typedef CGAL::Constrained_Delaunay_triangulation_2<K, TDS>             CDT;
 typedef CDT::Face_handle                                               FaceHandle;
 
 // ========================================================================
-// Helper: Build CGAL polygon from flat coordinate array
+// Helper: build a CGAL ring (simple polygon) from a flat coordinate array.
+// Removes a duplicate closing vertex; returns false if not a valid simple ring.
+// Orientation is left to the caller (outer = CCW, hole = CW).
 // ========================================================================
-static bool BuildPolygon(const std::vector<double>& Points, Polygon_2& OutPoly)
+static bool BuildRing(const std::vector<double>& Points, Polygon_2& OutPoly)
 {
     OutPoly.clear();
     for (size_t i = 0; i + 1 < Points.size(); i += 2)
-    {
         OutPoly.push_back(Point_2(Points[i], Points[i + 1]));
-    }
 
-    if (OutPoly.size() < 3)
-        return false;
-
-    // Remove duplicate closing vertex
     if (OutPoly.size() >= 2 &&
         CGAL::squared_distance(OutPoly.vertex(0), OutPoly.vertex(OutPoly.size() - 1)) < 0.01)
     {
@@ -142,53 +145,53 @@ static bool BuildPolygon(const std::vector<double>& Points, Polygon_2& OutPoly)
         OutPoly = Clean;
     }
 
-    if (OutPoly.size() < 3)
-        return false;
-
-    // Check polygon simplicity - CGAL requires simple polygons
-    if (!OutPoly.is_simple())
-    {
-        // Non-simple polygons cannot be processed by CGAL skeleton
-        return false;
-    }
-
-    // Ensure CCW orientation
-    if (OutPoly.orientation() != CGAL::COUNTERCLOCKWISE)
-    {
-        OutPoly.reverse_orientation();
-    }
-
-    return true;
+    return OutPoly.size() >= 3 && OutPoly.is_simple();
 }
 
 // ========================================================================
-// GenerateSkeleton - Full skeleton with vertex time data
+// GenerateSkeleton (with optional holes) - full skeleton with vertex times.
+// CGAL's straight skeleton natively supports a Polygon_with_holes_2, which
+// gives correct hipped/gabled roofs around inner courtyards.
 // ========================================================================
-CGALSkeletonResult CGAL_GenerateSkeleton(const std::vector<double>& PolygonPoints)
+CGALSkeletonResult CGAL_GenerateSkeletonWithHoles(
+    const std::vector<double>& OuterPoints,
+    const std::vector<std::vector<double>>& Holes)
 {
     CGALSkeletonResult Result;
     Result.MaxTime = 0.0;
 
-    Polygon_2 Poly;
-    if (!BuildPolygon(PolygonPoints, Poly))
+    Polygon_2 Outer;
+    if (!BuildRing(OuterPoints, Outer))
         return Result;
+    if (Outer.orientation() != CGAL::COUNTERCLOCKWISE)
+        Outer.reverse_orientation();
 
-    // Create straight skeleton with try-catch
     SkeletonPtr Skeleton;
     try
     {
-        Skeleton = CGAL::create_interior_straight_skeleton_2(
-            Poly.vertices_begin(), Poly.vertices_end());
-    }
-    catch (const std::exception& e)
-    {
-        // CGAL threw an exception during skeleton creation
-        // This can happen with degenerate or nearly-degenerate polygons
-        return Result;
+        if (Holes.empty())
+        {
+            Skeleton = CGAL::create_interior_straight_skeleton_2(
+                Outer.vertices_begin(), Outer.vertices_end());
+        }
+        else
+        {
+            Polygon_with_holes_2 PWH(Outer);
+            for (const std::vector<double>& H : Holes)
+            {
+                Polygon_2 Hole;
+                if (!BuildRing(H, Hole))
+                    continue;
+                // Holes must be clockwise inside a Polygon_with_holes_2.
+                if (Hole.orientation() != CGAL::CLOCKWISE)
+                    Hole.reverse_orientation();
+                PWH.add_hole(Hole);
+            }
+            Skeleton = CGAL::create_interior_straight_skeleton_2(PWH);
+        }
     }
     catch (...)
     {
-        // Unknown exception
         return Result;
     }
 
@@ -236,7 +239,42 @@ CGALSkeletonResult CGAL_GenerateSkeleton(const std::vector<double>& PolygonPoint
         Result.Edges.push_back(E);
     }
 
+    // ---- Extract FACES ----
+    // Each straight-skeleton face corresponds to one input contour edge and is
+    // the sloped roof panel above that edge. Walk the halfedge cycle of every
+    // face, collecting its boundary vertices in order. Building the roof from
+    // these faces (one polygon per footprint edge, all meeting at the ridge)
+    // gives a watertight, gap-free roof for ANY polygon, instead of the fragile
+    // Delaunay-over-points approach that drops triangles / spawns slivers.
+    for (auto FIt = Skeleton->faces_begin(); FIt != Skeleton->faces_end(); ++FIt)
+    {
+        CGALSkeletonFace Face;
+        auto H0 = FIt->halfedge();
+        if (H0 == Skeleton_2::Halfedge_handle())
+            continue;
+
+        auto H = H0;
+        int Guard = 0;
+        do
+        {
+            auto It = VertexToIndex.find(&*(H->vertex()));
+            if (It != VertexToIndex.end())
+                Face.VertexIndices.push_back(It->second);
+            H = H->next();
+            if (++Guard > 100000) break; // safety against malformed cycles
+        } while (H != H0 && H != Skeleton_2::Halfedge_handle());
+
+        if (Face.VertexIndices.size() >= 3)
+            Result.Faces.push_back(Face);
+    }
+
     return Result;
+}
+
+// No-holes convenience wrapper.
+CGALSkeletonResult CGAL_GenerateSkeleton(const std::vector<double>& PolygonPoints)
+{
+    return CGAL_GenerateSkeletonWithHoles(PolygonPoints, std::vector<std::vector<double>>());
 }
 
 // ========================================================================
@@ -267,133 +305,95 @@ std::vector<CGALSkeletonEdgePair> CGAL_GenerateSkeletonEdges(const std::vector<d
 }
 
 // ========================================================================
-// TriangulateWithCGAL - Constrained Delaunay Triangulation
+// Triangulate (with optional holes) - Constrained Delaunay Triangulation.
+// Inserts the outer ring + every hole ring as constraints, then classifies
+// faces by NESTING DEPTH (odd = inside, even/hole = outside). This excludes
+// inner courtyards from the triangulated surface.
+//
+// Index convention (unchanged): indices [0, outerVertCount) map to the OUTER
+// ring vertices; everything else (Steiner points AND hole vertices) is returned
+// in SteinerPoints, so callers can resolve them as (outer ++ SteinerPoints).
 // ========================================================================
-CGALTriangulationResult CGAL_Triangulate(const std::vector<double>& PolygonPoints)
+static void InsertRingConstraints(CDT& cdt, const std::vector<double>& Pts)
+{
+    std::vector<Point_2> Clean;
+    for (size_t i = 0; i + 1 < Pts.size(); i += 2)
+    {
+        Point_2 P(Pts[i], Pts[i + 1]);
+        bool bDup = false;
+        for (const Point_2& E : Clean)
+            if (CGAL::squared_distance(P, E) < 0.01) { bDup = true; break; }
+        if (!bDup) Clean.push_back(P);
+    }
+    if (Clean.size() < 3) return;
+    for (size_t i = 0; i < Clean.size(); i++)
+        cdt.insert_constraint(Clean[i], Clean[(i + 1) % Clean.size()]);
+}
+
+CGALTriangulationResult CGAL_TriangulateWithHoles(
+    const std::vector<double>& OuterPoints,
+    const std::vector<std::vector<double>>& Holes)
 {
     CGALTriangulationResult Result;
     Result.OriginalVertexCount = 0;
 
-    if (PolygonPoints.size() < 6) // need at least 3 points (6 doubles)
+    if (OuterPoints.size() < 6) // need at least 3 points
         return Result;
 
-    int NumInputVerts = static_cast<int>(PolygonPoints.size() / 2);
+    int NumInputVerts = static_cast<int>(OuterPoints.size() / 2);
     Result.OriginalVertexCount = NumInputVerts;
 
-    // Build points
-    std::vector<Point_2> Points;
-    Points.reserve(NumInputVerts);
-    for (int i = 0; i + 1 < (int)PolygonPoints.size(); i += 2)
-    {
-        Points.push_back(Point_2(PolygonPoints[i], PolygonPoints[i + 1]));
-    }
-
-    // Check for duplicate/collinear points that would cause CDT to crash
-    // Remove points that are too close together
-    std::vector<Point_2> CleanPoints;
-    CleanPoints.reserve(Points.size());
-    for (const Point_2& P : Points)
-    {
-        bool bDuplicate = false;
-        for (const Point_2& Existing : CleanPoints)
-        {
-            if (CGAL::squared_distance(P, Existing) < 0.01)
-            {
-                bDuplicate = true;
-                break;
-            }
-        }
-        if (!bDuplicate)
-            CleanPoints.push_back(P);
-    }
-
-    if (CleanPoints.size() < 3)
-        return Result;
-
-    // Create CDT with polygon edges as constraints
-    // Wrap in try-catch because CDT can throw on degenerate/intersecting input
     CDT cdt;
     try
     {
-        for (size_t i = 0; i < CleanPoints.size(); i++)
-        {
-            size_t next = (i + 1) % CleanPoints.size();
-            cdt.insert_constraint(CleanPoints[i], CleanPoints[next]);
-        }
-    }
-    catch (const std::exception& e)
-    {
-        // CDT threw an exception - likely self-intersecting polygon
-        // Return empty result so caller can fall back to ear-clipping
-        return Result;
+        InsertRingConstraints(cdt, OuterPoints);
+        for (const std::vector<double>& H : Holes)
+            InsertRingConstraints(cdt, H);
     }
     catch (...)
     {
-        // Unknown exception during CDT construction
         return Result;
     }
 
     if (cdt.number_of_vertices() < 3)
         return Result;
 
-    // Mark faces inside/outside using flood-fill from infinite faces.
-    // We use bIsInside as a "visited by outside flood" marker during traversal,
-    // then flip it at the end so that inside faces have bIsInside=true.
-    std::queue<FaceHandle> FaceQueue;
+    // ---- Mark domains by nesting depth (BFS from the infinite face) ----
     for (FaceHandle fh : cdt.all_face_handles())
-    {
-        fh->info().bIsInside = false;   // false = not yet visited by flood-fill
-        if (cdt.is_infinite(fh))
-        {
-            fh->info().bIsInside = true; // Mark infinite faces as visited immediately
-            FaceQueue.push(fh);
-        }
-    }
+        fh->info().Nesting = -1;
 
-    while (!FaceQueue.empty())
+    std::queue<FaceHandle> Q;
+    cdt.infinite_face()->info().Nesting = 0;
+    Q.push(cdt.infinite_face());
+    while (!Q.empty())
     {
-        FaceHandle fh = FaceQueue.front();
-        FaceQueue.pop();
-
+        FaceHandle fh = Q.front(); Q.pop();
         for (int i = 0; i < 3; i++)
         {
             FaceHandle ni = fh->neighbor(i);
-            // Create edge from face handle + index
-            CDT::Edge edge(fh, i);
-            // Only traverse across non-constrained edges to unvisited faces
-            if (!cdt.is_constrained(edge) && !ni->info().bIsInside)
+            if (ni->info().Nesting == -1)
             {
-                ni->info().bIsInside = true;  // Mark as visited BEFORE enqueuing
-                FaceQueue.push(ni);
+                CDT::Edge edge(fh, i);
+                ni->info().Nesting = fh->info().Nesting + (cdt.is_constrained(edge) ? 1 : 0);
+                Q.push(ni);
             }
         }
     }
 
-    // Now bIsInside=true means "reached from outside" (i.e., OUTSIDE).
-    // Flip: faces NOT reached by flood-fill are INSIDE.
-    for (FaceHandle fh : cdt.finite_face_handles())
-    {
-        fh->info().bIsInside = !fh->info().bIsInside;
-    }
-
-    // Build vertex index map
+    // ---- Index map: outer ring originals first ----
     std::map<Point_2, int> PointToIndex;
     int NextIdx = 0;
-
-    // First, add all original polygon vertices
     for (int i = 0; i < NumInputVerts; i++)
     {
-        Point_2 P(PolygonPoints[i * 2], PolygonPoints[i * 2 + 1]);
+        Point_2 P(OuterPoints[i * 2], OuterPoints[i * 2 + 1]);
         if (PointToIndex.find(P) == PointToIndex.end())
-        {
             PointToIndex[P] = NextIdx++;
-        }
     }
 
-    // Collect inside triangles
+    // ---- Collect inside (odd-nesting) faces ----
     for (FaceHandle fh : cdt.finite_face_handles())
     {
-        if (!fh->info().bIsInside)
+        if (!fh->info().IsInside())
             continue;
 
         int TriIndices[3];
@@ -407,7 +407,6 @@ CGALTriangulationResult CGAL_Triangulate(const std::vector<double>& PolygonPoint
             }
             else
             {
-                // Steiner point
                 TriIndices[i] = NextIdx;
                 PointToIndex[P] = NextIdx;
                 Result.SteinerPoints.push_back(CGAL::to_double(P.x()));
@@ -422,4 +421,10 @@ CGALTriangulationResult CGAL_Triangulate(const std::vector<double>& PolygonPoint
     }
 
     return Result;
+}
+
+// No-holes convenience wrapper.
+CGALTriangulationResult CGAL_Triangulate(const std::vector<double>& PolygonPoints)
+{
+    return CGAL_TriangulateWithHoles(PolygonPoints, std::vector<std::vector<double>>());
 }

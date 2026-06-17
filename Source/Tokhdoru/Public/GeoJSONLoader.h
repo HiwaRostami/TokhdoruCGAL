@@ -40,12 +40,15 @@ enum class ERoofShape
         Saltbox,
         QuadrupleSaltbox,
         Hipped,
+        HalfHipped,     // Dutch hip / clipped gable
         Pyramidal,
         Skillion,
         Mansard,
         Gambrel,
         Dome,
-        Onion
+        Onion,
+        Round,          // Barrel vault
+        CrossGabled,    // Perpendicular ridges for L/T footprints
 };
 
 // ============================================================================
@@ -55,8 +58,13 @@ enum class ERoofShape
 // ============================================================================
 struct FGeoBuilding
 {
-        TArray<FVector2D> Nodes;        // Building footprint polygon (local meters)
+        TArray<FVector2D> Nodes;        // Building footprint OUTER ring (local meters)
         TArray<FDoublePoint2D> RawLonLat; // Raw WGS84 lon/lat for precision
+        // Inner rings = courtyards / holes (multipolygon "inner" members).
+        // Holes are in the same coord space as Nodes (local meters); HolesRaw
+        // keeps the WGS84 source so they convert alongside Nodes.
+        TArray<TArray<FVector2D>>      Holes;
+        TArray<TArray<FDoublePoint2D>> HolesRaw;
         double Height;                  // Building height in meters
         double MinHeight;               // Minimum height / base elevation in meters
         int32 Levels;                   // Number of building levels (building:levels)
@@ -72,6 +80,9 @@ struct FGeoBuilding
         int32 BuildingType;             // 0=residential, 1=commercial, 2=industrial, 3=other
         FString BuildingTypeStr;        // Raw building type string from OSM (e.g. "residential", "yes")
         bool bIsBuildingPart;           // True if this is a building:part
+        bool bIsTowerPart;              // True if building:part=tower (a free-standing tower, not a roof turret)
+        bool bSuppressOutline;          // True if this is an outline covered by building:parts (don't render in 3D)
+        bool bSuppressRoof;             // True if this part's flat roof is covered by another part on top (skip roof cap)
         FString BuildingPartId;         // OSM ID for building:part grouping
         bool bHasExplicitBuildingColour;// True if building:colour was explicitly set in OSM
         bool bHasExplicitRoofColor;     // True if roof:colour was explicitly set in OSM
@@ -93,9 +104,12 @@ struct FGeoBuilding
                 , RoofLevels(0)
                 , RoofShape(ERoofShape::Flat)
                 , RoofAngle(0.0)
-                , RoofDirection(0.0)
+                , RoofDirection(-1.0)   // -1 = not specified; 0..360 = explicit OSM value
                 , BuildingType(0)
                 , bIsBuildingPart(false)
+                , bIsTowerPart(false)
+                , bSuppressOutline(false)
+                , bSuppressRoof(false)
                 , bHasExplicitBuildingColour(false)
                 , bHasExplicitRoofColor(false)
                 , WallColor(FLinearColor(0.71f, 0.67f, 0.63f))    // Default: warm beige (180,170,160)
@@ -231,6 +245,74 @@ struct FGeoTree
                 , RawLonLat(0.0, 0.0)
                 , CrownRadius(3.0f)
                 , Height(10.0f)
+        {}
+};
+
+// ============================================================================
+// FElevationSample - WGS84 elevation point (OSM ele tag or GeoJSON Z coord)
+// Used to deform the ground mesh when enough samples are available.
+// ============================================================================
+struct FElevationSample
+{
+        FVector2D Location;             // local meters (after ConvertAllCoordsToLocal)
+        FDoublePoint2D RawLonLat;       // raw WGS84 lon/lat
+        double Elevation;               // meters above sea level
+
+        FElevationSample()
+                : Location(FVector2D::ZeroVector)
+                , RawLonLat(0.0, 0.0)
+                , Elevation(0.0)
+        {}
+};
+
+// ============================================================================
+// FGeoPOIHelpers - marker colours by amenity/shop/tourism (streets.gl style)
+// ============================================================================
+class FGeoPOIHelpers
+{
+public:
+        static FLinearColor MarkerColorForPOI(const FGeoPOI& POI)
+        {
+                const FString Sub = POI.POISubType.ToLower();
+                const FString Type = POI.POIType.ToLower();
+
+                if (Sub.Contains(TEXT("restaurant")) || Sub.Contains(TEXT("cafe")) || Sub.Contains(TEXT("fast_food")))
+                        return FLinearColor(0.90f, 0.35f, 0.20f);
+                if (Sub.Contains(TEXT("hospital")) || Sub.Contains(TEXT("clinic")) || Sub.Contains(TEXT("doctors")))
+                        return FLinearColor(0.95f, 0.95f, 0.95f);
+                if (Sub.Contains(TEXT("school")) || Sub.Contains(TEXT("university")) || Sub.Contains(TEXT("college")))
+                        return FLinearColor(0.95f, 0.85f, 0.20f);
+                if (Sub.Contains(TEXT("fuel")) || Sub.Contains(TEXT("parking")))
+                        return FLinearColor(0.55f, 0.55f, 0.55f);
+                if (Type == TEXT("shop"))
+                        return FLinearColor(0.20f, 0.45f, 0.90f);
+                if (Type == TEXT("tourism"))
+                        return FLinearColor(0.65f, 0.25f, 0.85f);
+                if (Type == TEXT("amenity"))
+                        return FLinearColor(0.85f, 0.25f, 0.25f);
+                return POI.Color;
+        }
+};
+
+// ============================================================================
+// FGeoModelInstance - a single placed 3D model from an OSM node (street
+// furniture, power, landmarks, ...). ModelType matches a folder under
+// /Tokhdoru/Models/ (e.g. "bench", "hydrant", "transmission_tower"). Mirrors
+// streets-gl's node->instance mapping (OSMNodeQualifierFactory).
+// ============================================================================
+struct FGeoModelInstance
+{
+        FVector2D Location;             // local meters (filled by ConvertAllCoordsToLocal)
+        FDoublePoint2D RawLonLat;       // raw WGS84 lon/lat
+        FString ModelType;              // folder name under /Tokhdoru/Models/
+        float RotationDeg;              // OSM 'direction' yaw; < 0 = random
+        float Height;                   // meters (0 = use model's native size)
+
+        FGeoModelInstance()
+                : Location(FVector2D::ZeroVector)
+                , RawLonLat(0.0, 0.0)
+                , RotationDeg(-1.f)
+                , Height(0.f)
         {}
 };
 
@@ -434,6 +516,15 @@ namespace FOSMRoofShapeParser
                 if (Lower == TEXT("saltbox"))    return ERoofShape::Saltbox;
                 if (Lower == TEXT("quadruple_saltbox") ||
                     Lower == TEXT("quadruple saltbox")) return ERoofShape::QuadrupleSaltbox;
+                if (Lower == TEXT("half-hipped") || Lower == TEXT("half_hipped") ||
+                    Lower == TEXT("dutch_gable") || Lower == TEXT("clipped_gable"))
+                    return ERoofShape::HalfHipped;
+                if (Lower == TEXT("round") || Lower == TEXT("barrel_vault") ||
+                    Lower == TEXT("barrel vault"))
+                    return ERoofShape::Round;
+                if (Lower == TEXT("cross_gabled") || Lower == TEXT("cross gabled") ||
+                    Lower == TEXT("cross-gabled"))
+                    return ERoofShape::CrossGabled;
 
                 return Default;
         }
@@ -522,6 +613,8 @@ public:
         const TArray<FGeoPOI>& GetPOIs() const { return POIs; }
         const TArray<FGeoRailway>& GetRailways() const { return Railways; }
         const TArray<FGeoTree>& GetTrees() const { return Trees; }
+        const TArray<FGeoModelInstance>& GetModelInstances() const { return ModelInstances; }
+        const TArray<FElevationSample>& GetElevationSamples() const { return ElevationSamples; }
 
         /** Check if data has been loaded */
         bool IsLoaded() const { return bIsLoaded; }
@@ -543,6 +636,8 @@ private:
         TArray<FGeoPOI> POIs;
         TArray<FGeoRailway> Railways;
         TArray<FGeoTree> Trees;
+        TArray<FGeoModelInstance> ModelInstances; // OSM model placements (GeoJSON: usually empty)
+        TArray<FElevationSample> ElevationSamples;
 
         // State
         bool bIsLoaded;

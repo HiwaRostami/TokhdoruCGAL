@@ -5,11 +5,6 @@
 #include "Algo/Reverse.h"
 
 // ============================================================================
-// Static member definition (must be defined exactly once in a .cpp file)
-// ============================================================================
-bool FGeoMeshGenerator::bUseCGALSkeleton = true;
-
-// ============================================================================
 // Local helper: Convert FLinearColor to FColor
 // ============================================================================
 static FColor LinearToFColor(const FLinearColor& LC)
@@ -193,6 +188,25 @@ void FGeoMeshGenerator::AddPolygonTriangulated(
         int32 N = WorkingPoints.Num();
         if (N < 3) return;
 
+        // Compute signed area BEFORE adding vertices so we can normalize winding.
+        // Positive area = CCW (face up), negative = CW (face down).
+        float PolyArea = 0.f;
+        for (int32 i = 0; i < N; i++)
+        {
+                int32 j = (i + 1) % N;
+                PolyArea += WorkingPoints[i].X * WorkingPoints[j].Y - WorkingPoints[j].X * WorkingPoints[i].Y;
+        }
+        // Normalize to CCW so emitted triangles always face +Z and the hardcoded
+        // (0,0,1) normals are correct. OSM polygons have Y negated on load, which
+        // flips CW<->CCW; without this, vegetation and water normals point downward.
+        // IMPORTANT: must do this BEFORE adding to MeshData so vertex order matches.
+        if (PolyArea < 0.f)
+        {
+                Algo::Reverse(WorkingPoints);
+                PolyArea = -PolyArea;
+        }
+        const float EarCrossSign = 1.f; // Always CCW after normalization above
+
         int32 BI = MeshData.Vertices.Num();
         FVector GlobalTangent = FVector(1, 0, 0);
         if (N > 1)
@@ -231,6 +245,8 @@ void FGeoMeshGenerator::AddPolygonTriangulated(
 
                         float Cross = (vc.X - vp.X) * (vn.Y - vp.Y) - (vc.Y - vp.Y) * (vn.X - vp.X);
                         if (FMath::Abs(Cross) <= 0.01f) continue;
+                        // Only accept ears that are convex corners (matching polygon winding)
+                        if (Cross * EarCrossSign < 0.f) continue;
 
                         bool bIsEar = true;
                         for (int32 j = 0; j < NI; j++)
@@ -256,11 +272,34 @@ void FGeoMeshGenerator::AddPolygonTriangulated(
                         Fail++;
                         if (Fail > NI * 3)
                         {
+                                // Emergency fan fallback: only emit triangles whose centroid
+                                // lies inside the original polygon to avoid spurious fills
+                                // on U/L-shaped concave footprints.
                                 for (int32 i = 1; i < Idx.Num() - 1; i++)
                                 {
-                                        MeshData.Triangles.Add(BI + Idx[0]);
-                                        MeshData.Triangles.Add(BI + Idx[i]);
-                                        MeshData.Triangles.Add(BI + Idx[i + 1]);
+                                        FVector2D CA = FVector2D(WorkingPoints[Idx[0]].X, WorkingPoints[Idx[0]].Y);
+                                        FVector2D CB = FVector2D(WorkingPoints[Idx[i]].X, WorkingPoints[Idx[i]].Y);
+                                        FVector2D CC = FVector2D(WorkingPoints[Idx[i + 1]].X, WorkingPoints[Idx[i + 1]].Y);
+                                        FVector2D TriCen = (CA + CB + CC) / 3.f;
+
+                                        // Point-in-polygon test for the triangle centroid
+                                        bool bInside = false;
+                                        TArray<FVector2D> PolyPts;
+                                        for (const FVector& V : WorkingPoints)
+                                                PolyPts.Add(FVector2D(V.X, V.Y));
+                                        int32 PN = PolyPts.Num();
+                                        for (int32 pi = 0, pj = PN - 1; pi < PN; pj = pi++)
+                                        {
+                                                if (((PolyPts[pi].Y > TriCen.Y) != (PolyPts[pj].Y > TriCen.Y)) &&
+                                                        (TriCen.X < (PolyPts[pj].X - PolyPts[pi].X) * (TriCen.Y - PolyPts[pi].Y) / (PolyPts[pj].Y - PolyPts[pi].Y) + PolyPts[pi].X))
+                                                        bInside = !bInside;
+                                        }
+                                        if (bInside)
+                                        {
+                                                MeshData.Triangles.Add(BI + Idx[0]);
+                                                MeshData.Triangles.Add(BI + Idx[i]);
+                                                MeshData.Triangles.Add(BI + Idx[i + 1]);
+                                        }
                                 }
                                 return;
                         }
@@ -268,9 +307,27 @@ void FGeoMeshGenerator::AddPolygonTriangulated(
         }
         if (Idx.Num() == 3)
         {
-                MeshData.Triangles.Add(BI + Idx[0]);
-                MeshData.Triangles.Add(BI + Idx[1]);
-                MeshData.Triangles.Add(BI + Idx[2]);
+                // Final triangle: verify its centroid is inside the polygon
+                FVector2D CA = FVector2D(WorkingPoints[Idx[0]].X, WorkingPoints[Idx[0]].Y);
+                FVector2D CB = FVector2D(WorkingPoints[Idx[1]].X, WorkingPoints[Idx[1]].Y);
+                FVector2D CC = FVector2D(WorkingPoints[Idx[2]].X, WorkingPoints[Idx[2]].Y);
+                FVector2D TriCen = (CA + CB + CC) / 3.f;
+                bool bInside = false;
+                int32 PN = N; // use original vertex count for polygon test
+                for (int32 pi = 0, pj = PN - 1; pi < PN; pj = pi++)
+                {
+                        FVector2D PA(WorkingPoints[pi].X, WorkingPoints[pi].Y);
+                        FVector2D PB(WorkingPoints[pj].X, WorkingPoints[pj].Y);
+                        if (((PA.Y > TriCen.Y) != (PB.Y > TriCen.Y)) &&
+                                (TriCen.X < (PB.X - PA.X) * (TriCen.Y - PA.Y) / (PB.Y - PA.Y) + PA.X))
+                                bInside = !bInside;
+                }
+                if (bInside)
+                {
+                        MeshData.Triangles.Add(BI + Idx[0]);
+                        MeshData.Triangles.Add(BI + Idx[1]);
+                        MeshData.Triangles.Add(BI + Idx[2]);
+                }
         }
 }
 
@@ -309,6 +366,104 @@ void FGeoMeshGenerator::AddExtrudedPolygon(
                 for (int32 v = 0; v < 4; v++) { MeshData.Normals.Add(OutN); MeshData.VertexColors.Add(WallColor); MeshData.Tangents.Add(FProcMeshTangent(Tang, false)); }
         }
         if (bBottom) AddPolygonTriangulated(MeshData, WorkPoints, BaseH, BotColor);
+}
+
+// ============================================================================
+// AddSkillionExtrudedPolygon
+// Like AddExtrudedPolygon but the TOP of each wall vertex follows the skillion
+// roof slope, so the wall hugs the underside of the roof exactly.
+// RoofDirection: OSM bearing (0=N,90=E,...) of the LOW eave — same convention
+//                as AddSkillionRoof.  Pass -1 to fall back to flat top.
+// WallTopFlat:   the uniform wall-top height used when RoofDirection < 0.
+// RoofH:         vertical rise from low eave to high eave.
+// ============================================================================
+void FGeoMeshGenerator::AddSkillionExtrudedPolygon(
+        FMeshData& MeshData, const TArray<FVector>& Points,
+        float BaseH, float WallTopFlat,
+        float RoofH, float RoofDirection,
+        const FColor& WallColor)
+{
+        int32 N = Points.Num();
+        if (N < 3) return;
+
+        TArray<FVector> WorkPoints = Points;
+        if (ComputeSignedArea2D(WorkPoints) < 0.f)
+                Algo::Reverse(WorkPoints);
+
+        // Pre-compute per-vertex top Z using the same slope logic as AddSkillionRoof.
+        // Footprint Y is already negated (local space), so North = -Y: negate Cos.
+        TArray<float> TopZ;
+        TopZ.SetNum(N);
+
+        if (RoofDirection >= 0.f)
+        {
+                // Match streets-gl SkillionRoofBuilder.getRotation (same as the roof):
+                //   rotation = -toRad(direction) - PI/2, slope-up = (-cos D, -sin D).
+                // OSM roof:direction is the downslope azimuth (clockwise from north).
+                // In local space X=east, Y=-north, so the upslope (toward the high eave)
+                // is (-sin D, cos D). MaxProj = high-eave (tall wall), MinProj = low-eave.
+                float D_rad = FMath::DegreesToRadians(RoofDirection);
+                FVector2D SlopeDir(-FMath::Sin(D_rad), FMath::Cos(D_rad));
+
+                float MinProj = FLT_MAX, MaxProj = -FLT_MAX;
+                for (const FVector& V : WorkPoints)
+                {
+                        float Proj = V.X * SlopeDir.X + V.Y * SlopeDir.Y;
+                        MinProj = FMath::Min(MinProj, Proj);
+                        MaxProj = FMath::Max(MaxProj, Proj);
+                }
+                float Range = FMath::Max(MaxProj - MinProj, 1.f);
+
+                for (int32 i = 0; i < N; i++)
+                {
+                        float Proj = WorkPoints[i].X * SlopeDir.X + WorkPoints[i].Y * SlopeDir.Y;
+                        // Use IDENTICAL T mapping as AddSkillionRoof:
+                        // T=0 -> MinProj (low eave, Z=WallTopFlat+0)
+                        // T=1 -> MaxProj (high eave, Z=WallTopFlat+RoofH)
+                        // This makes wall top == roof bottom at every vertex.
+                        float T = (Proj - MinProj) / Range;
+                        TopZ[i] = WallTopFlat + FMath::Lerp(0.f, RoofH, T);
+                }
+        }
+        else
+        {
+                for (int32 i = 0; i < N; i++)
+                        TopZ[i] = WallTopFlat;
+        }
+
+        // Emit one quad per edge, with per-vertex top heights.
+        for (int32 i = 0; i < N; i++)
+        {
+                int32 Next = (i + 1) % N;
+                FVector B0(WorkPoints[i].X,    WorkPoints[i].Y,    BaseH);
+                FVector B1(WorkPoints[Next].X, WorkPoints[Next].Y, BaseH);
+                FVector T1(WorkPoints[Next].X, WorkPoints[Next].Y, TopZ[Next]);
+                FVector T0(WorkPoints[i].X,    WorkPoints[i].Y,    TopZ[i]);
+
+                FVector EdgeDir = B1 - B0;
+                FVector OutN = FVector(EdgeDir.Y, -EdgeDir.X, 0);
+                if (!OutN.IsNearlyZero()) OutN.Normalize(); else OutN = FVector(0, 0, 1);
+                FVector Tang = EdgeDir; if (!Tang.IsNearlyZero()) Tang.Normalize(); else Tang = FVector(1, 0, 0);
+
+                int32 BI = MeshData.Vertices.Num();
+                MeshData.Vertices.Add(B0); MeshData.Vertices.Add(B1);
+                MeshData.Vertices.Add(T1); MeshData.Vertices.Add(T0);
+                MeshData.Triangles.Add(BI + 0); MeshData.Triangles.Add(BI + 2); MeshData.Triangles.Add(BI + 1);
+                MeshData.Triangles.Add(BI + 0); MeshData.Triangles.Add(BI + 3); MeshData.Triangles.Add(BI + 2);
+
+                float WW = FVector2D::Distance(FVector2D(B0.X, B0.Y), FVector2D(B1.X, B1.Y)) / 100.f;
+                float V0 = BaseH   / 100.f;
+                float V1i = TopZ[i]    / 100.f;
+                float V1n = TopZ[Next] / 100.f;
+                MeshData.UV0.Add(FVector2D(0,  V0));  MeshData.UV0.Add(FVector2D(WW, V0));
+                MeshData.UV0.Add(FVector2D(WW, V1n)); MeshData.UV0.Add(FVector2D(0,  V1i));
+                for (int32 v = 0; v < 4; v++)
+                {
+                        MeshData.Normals.Add(OutN);
+                        MeshData.VertexColors.Add(WallColor);
+                        MeshData.Tangents.Add(FProcMeshTangent(Tang, false));
+                }
+        }
 }
 
 // ============================================================================
@@ -417,13 +572,19 @@ bool FGeoMeshGenerator::SplitPolygon2D(
         if (Intersections.Num() < 2 || Intersections.Num() % 2 != 0)
                 return false;
 
+        // Reserve enough capacity so that OutPolygons never reallocates while we hold
+        // raw pointers to its elements in the Crossback fields.
+        OutPolygons.Reserve(Intersections.Num() / 2 + 1);
         OutPolygons.Add(TArray<FVector2D>());
         TArray<FVector2D>* CurPoly = &OutPolygons[0];
 
         for (int32 iVert = 0; iVert < N; iVert++)
         {
-                CurPoly->Add(Polygon[iVert]);
-
+                // Check for intersection on the edge ENDING at this vertex BEFORE adding the vertex.
+                // The intersection point must be emitted to the current polygon first, then we switch
+                // polygons, then the current vertex goes into the new polygon.
+                // (Old code added the vertex first, placing both endpoints of the cut edge into the
+                // same sub-polygon and producing wrong top/bottom splits instead of left/right splits.)
                 int32 InterIdx = -1;
                 for (int32 j = 0; j < Intersections.Num(); j++)
                 {
@@ -453,6 +614,8 @@ bool FGeoMeshGenerator::SplitPolygon2D(
 
                         CurPoly->Add(Intersections[InterIdx].Point);
                 }
+
+                CurPoly->Add(Polygon[iVert]);
         }
 
         return OutPolygons.Num() >= 2;
@@ -493,13 +656,13 @@ TArray<FVector> FGeoMeshGenerator::InsetPolygonByEdgeOffset(
                 float Edge1Len = Edge1.Size();
                 if (Edge1Len < 0.001f) { Result.Add(WorkFP[i]); continue; }
                 Edge1 /= Edge1Len;
-                FVector2D Norm1(Edge1.Y, -Edge1.X);
+                FVector2D Norm1(-Edge1.Y, Edge1.X); // INWARD normal (CCW) -> positive InsetDist shrinks
 
                 FVector2D Edge2 = PNext - PCurr;
                 float Edge2Len = Edge2.Size();
                 if (Edge2Len < 0.001f) { Result.Add(WorkFP[i]); continue; }
                 Edge2 /= Edge2Len;
-                FVector2D Norm2(Edge2.Y, -Edge2.X);
+                FVector2D Norm2(-Edge2.Y, Edge2.X); // INWARD normal (CCW) -> positive InsetDist shrinks
 
                 FVector2D L1A = PPrev + Norm1 * InsetDist;
                 FVector2D L1B = PCurr + Norm1 * InsetDist;
@@ -508,18 +671,38 @@ TArray<FVector> FGeoMeshGenerator::InsetPolygonByEdgeOffset(
 
                 float Den = (L1B.X - L1A.X) * (L2B.Y - L2A.Y) - (L1B.Y - L1A.Y) * (L2B.X - L2A.X);
 
+                FVector2D Candidate;
                 if (FMath::Abs(Den) < 0.001f)
                 {
-                        FVector2D Mid = (L1B + L2A) * 0.5f;
-                        Result.Add(FVector(Mid.X, Mid.Y, WorkFP[i].Z));
+                        Candidate = (L1B + L2A) * 0.5f;
                 }
                 else
                 {
                         float T = ((L2A.X - L1A.X) * (L2B.Y - L2A.Y) - (L2A.Y - L1A.Y) * (L2B.X - L2A.X)) / Den;
                         T = FMath::Clamp(T, -2.f, 2.f);
-                        FVector2D Intersection(L1A.X + T * (L1B.X - L1A.X), L1A.Y + T * (L1B.Y - L1A.Y));
-                        Result.Add(FVector(Intersection.X, Intersection.Y, WorkFP[i].Z));
+                        Candidate = FVector2D(L1A.X + T * (L1B.X - L1A.X), L1A.Y + T * (L1B.Y - L1A.Y));
                 }
+
+                // For concave corners the inset vertex can overshoot outside the
+                // polygon. Clamp it back: if it moved further from the centroid
+                // than the original vertex, snap to a centroid-lerp position.
+                {
+                        FVector2D OrigXY(PCurr.X, PCurr.Y);
+                        FVector2D CenXY(0.f, 0.f);
+                        for (const FVector& V : WorkFP) { CenXY.X += V.X; CenXY.Y += V.Y; }
+                        CenXY /= (float)N;
+                        float OrigDistToCen = FVector2D::Distance(OrigXY, CenXY);
+                        float CandDistToCen = FVector2D::Distance(Candidate, CenXY);
+                        if (CandDistToCen > OrigDistToCen || FVector2D::Distance(Candidate, OrigXY) > InsetDist * 3.f)
+                        {
+                                float MoveAmt = FMath::Min(InsetDist, OrigDistToCen * 0.45f);
+                                FVector2D Dir = CenXY - OrigXY;
+                                if (!Dir.IsNearlyZero()) Dir.Normalize();
+                                Candidate = OrigXY + Dir * MoveAmt;
+                        }
+                }
+
+                Result.Add(FVector(Candidate.X, Candidate.Y, WorkFP[i].Z));
         }
 
         return Result;
@@ -691,6 +874,184 @@ void FGeoMeshGenerator::ComputeDataBounds(
 // ============================================================================
 // ============================================================================
 
+// ----------------------------------------------------------------------------
+// BarrelAxisDir — barrel (ridge) direction for a round roof, taken from the
+// FOOTPRINT'S OWN EDGES rather than the world-aligned AABB, so the barrel always
+// follows the base walls even when the building sits at an angle. The footprint's
+// longest edge defines the long axis; "along" (default) runs the ridge along it,
+// "across" runs it perpendicular. Shared by AddRoundRoof and ComputeBarrelRise so
+// the rise used for wall-lowering matches the geometry the roof builder emits.
+// ----------------------------------------------------------------------------
+static FVector2D BarrelAxisDir(const TArray<FVector>& FP, const FString& RoofOrientation)
+{
+        const int32 N = FP.Num();
+        FVector2D LongDir(1.f, 0.f);
+        float BestLen = -1.f;
+        for (int32 i = 0; i < N; i++)
+        {
+                const FVector& A = FP[i];
+                const FVector& B = FP[(i + 1) % N];
+                FVector2D E(B.X - A.X, B.Y - A.Y);
+                const float Len = E.Size();
+                if (Len > BestLen) { BestLen = Len; LongDir = E / FMath::Max(Len, KINDA_SMALL_NUMBER); }
+        }
+
+        const bool bAcross = (RoofOrientation.ToLower() == TEXT("across"));
+        // Default "along": ridge runs along the longest edge. "across": perpendicular.
+        return bAcross ? FVector2D(-LongDir.Y, LongDir.X) : LongDir;
+}
+
+// ============================================================================
+// ComputeBarrelRise — rise (arch radius) of a round/barrel roof = half the
+// footprint span perpendicular to the (rotated) barrel axis. Footprint must be
+// in local units (cm). Mirrors AddRoundRoof so wall-lowering matches the roof.
+// ============================================================================
+static float ComputeBarrelRise(const TArray<FVector>& FP, const FString& RoofOrientation)
+{
+        if (FP.Num() < 3) return 0.f;
+        const FVector2D AxisDir = BarrelAxisDir(FP, RoofOrientation);
+        const FVector2D CrossDir(-AxisDir.Y, AxisDir.X);
+        float CrossMin = FLT_MAX, CrossMax = -FLT_MAX;
+        for (const FVector& V : FP)
+        {
+                const float CP = V.X * CrossDir.X + V.Y * CrossDir.Y;
+                CrossMin = FMath::Min(CrossMin, CP);
+                CrossMax = FMath::Max(CrossMax, CP);
+        }
+        return (CrossMax - CrossMin) * 0.5f;
+}
+
+// ============================================================================
+// GentleSkillionRise — soften over-steep SMALL triangular skillion "shoulders".
+// The little triangular skillion parts that flank a rounded apse (e.g. the
+// Frauenkirche) carry a roof:height far larger than their tiny run, so they
+// render as near-vertical (~60°) slanted walls. Clamp those to a believable
+// pitch (~24°). Only footprints with up to 4 vertices are affected, so large
+// multi-vertex skillion towers/spires keep their intended steep design.
+// Footprint and rise are in local units (cm); RoofDirectionDeg < 0 means "unset".
+// ============================================================================
+static float GentleSkillionRise(const TArray<FVector>& FP, float RoofDirectionDeg, float Rise)
+{
+        if (RoofDirectionDeg < 0.f || FP.Num() < 2 || Rise <= 0.f) return Rise;
+        if (FP.Num() > 4) return Rise;   // only small triangular/quad shoulders
+
+        const float D = FMath::DegreesToRadians(RoofDirectionDeg);
+        const FVector2D Dir(FMath::Sin(D), FMath::Cos(D));
+        float MinP = FLT_MAX, MaxP = -FLT_MAX;
+        for (const FVector& V : FP)
+        {
+                const float P = V.X * Dir.X + V.Y * Dir.Y;
+                MinP = FMath::Min(MinP, P); MaxP = FMath::Max(MaxP, P);
+        }
+        const float Run = FMath::Max(MaxP - MinP, 1.f);
+        const float MaxRatio = 0.45f;    // tan(~24°) — cap the pitch
+        return FMath::Min(Rise, MaxRatio * Run);
+}
+
+// Does a pitched roof shape have a real eave below its peak?
+static bool RoofShapeHasEave(ERoofShape S)
+{
+        switch (S)
+        {
+        case ERoofShape::Gabled:    case ERoofShape::Saltbox:
+        case ERoofShape::QuadrupleSaltbox: case ERoofShape::CrossGabled:
+        case ERoofShape::Hipped:    case ERoofShape::HalfHipped:
+        case ERoofShape::Pyramidal: case ERoofShape::Mansard:
+        case ERoofShape::Gambrel:   case ERoofShape::Round:
+        case ERoofShape::Skillion:
+                return true;
+        default:
+                return false;
+        }
+}
+
+// Two parts are adjacent if their footprints share an EDGE (>=2 common nodes).
+static bool PartsShareEdge(const FGeoBuilding& A, const FGeoBuilding& B)
+{
+        int32 Shared = 0;
+        for (const FVector2D& N : A.Nodes)
+        {
+                for (const FVector2D& M : B.Nodes)
+                        if (N.Equals(M, 0.05f)) { Shared++; break; }
+                if (Shared >= 2) return true;
+        }
+        return false;
+}
+
+// True if this part shares a footprint edge with any onion/dome turret.
+static bool IsAdjacentToOnionDome(const FGeoBuilding& B, const TArray<FGeoBuilding>& All)
+{
+        for (const FGeoBuilding& O : All)
+        {
+                if (&O == &B) continue;
+                if (O.RoofShape != ERoofShape::Onion && O.RoofShape != ERoofShape::Dome) continue;
+                if (PartsShareEdge(B, O)) return true;
+        }
+        return false;
+}
+
+// ============================================================================
+// AdjacentRoofEave — for an onion/dome turret, the LOWEST pitched-roof eave (cm)
+// found anywhere in the connected building complex the turret belongs to. Parts
+// are connected when they share a footprint edge; a breadth-first walk over that
+// graph means a turret aligns to the main roofline even when it only touches a
+// neighbour (e.g. a skillion shoulder) that in turn connects to the main gabled
+// roof. Returns -1 if the complex has no pitched roof. Fully generic.
+// ============================================================================
+static float AdjacentRoofEave(const FGeoBuilding& B, const TArray<FGeoBuilding>& All, float ScaleFactor)
+{
+        const int32 N = All.Num();
+        int32 Start = -1;
+        for (int32 i = 0; i < N; i++) if (&All[i] == &B) { Start = i; break; }
+        if (Start < 0) return -1.f;
+
+        TArray<bool> Visited; Visited.Init(false, N);
+        TArray<int32> Queue;  Queue.Add(Start); Visited[Start] = true;
+
+        float Best = -1.f;
+        for (int32 qi = 0; qi < Queue.Num(); qi++)
+        {
+                const FGeoBuilding& C = All[Queue[qi]];
+
+                if (Queue[qi] != Start && C.RoofHeight > 0.0 && RoofShapeHasEave(C.RoofShape))
+                {
+                        const float Eave = (float)((C.Height - C.RoofHeight) * (double)ScaleFactor);
+                        if (Eave > 1.f && (Best < 0.f || Eave < Best)) Best = Eave;
+                }
+
+                for (int32 j = 0; j < N; j++)
+                        if (!Visited[j] && PartsShareEdge(C, All[j]))
+                        {
+                                Visited[j] = true;
+                                Queue.Add(j);
+                        }
+        }
+        return Best;
+}
+
+// ============================================================================
+// DomeNestleEave — the eave a dome/onion/skillion part should "nestle into",
+// or -1 to disable the heuristic for this part.
+//
+// The "drop the column / stretch the skillion down to the adjacent roofline"
+// behaviour is meant for a SMALL turret or shoulder poking out of a neighbour's
+// pitched roof. It must NOT fire for a free-standing tower (building:part=tower,
+// e.g. the 60 m Alter Peter tower) nor for any part so much taller than the
+// surrounding eave that attaching would collapse it. The guard: skip towers
+// outright, and only nestle when the eave sits in the UPPER HALF of the part —
+// a turret pops out a little (eave high), a tower towers over a low roofline.
+// Top/Base are the part's absolute top and base in the same (local cm) units.
+// ============================================================================
+static float DomeNestleEave(const FGeoBuilding& B, const TArray<FGeoBuilding>& All,
+        float ScaleFactor, float Top, float Base)
+{
+        if (B.bIsTowerPart) return -1.f;                       // free-standing tower
+        const float Eave = AdjacentRoofEave(B, All, ScaleFactor);
+        if (Eave <= Base + 1.f || Eave >= Top) return -1.f;    // no usable neighbour eave
+        if (Eave < 0.5f * (Top - Base) + Base) return -1.f;    // a tower, not a turret
+        return Eave;
+}
+
 // ============================================================================
 // AddRoofGeometry - router that dispatches based on ERoofShape
 // ============================================================================
@@ -700,33 +1061,88 @@ void FGeoMeshGenerator::AddRoofGeometry(
         const TArray<FVector>& LocalFootprint,
         float WallTopZ,
         float RoofH,
-        const FColor& RoofFColor)
+        const FColor& RoofFColor,
+        const TArray<TArray<FVector2D>>& Holes,
+        float RoofDirection,
+        const FString& RoofOrientation,
+        const FColor& WallColor)
 {
         switch (RoofShape)
         {
         case ERoofShape::Flat:
         default:
         {
-                const float ParapetHeight = 70.0f;
-                const float ParapetWidth = 30.0f;
-                float ParapetTop = WallTopZ + ParapetHeight;
-                float RoofZ = WallTopZ;
+                // streets.gl FlatRoofBuilder: the flat roof is simply the
+                // building footprint triangulated flush with the wall top
+                // (no parapet, no inset). The robust CGAL CDT handles concave
+                // footprints (L/U-shaped buildings) and courtyard holes
+                // correctly, replacing the old inset+parapet hack that produced
+                // an extra plane across the U-notch and detached upward caps.
+                const float RoofZ = WallTopZ;
 
-                TArray<FVector> InnerFP = InsetPolygonByEdgeOffset(LocalFootprint, ParapetWidth);
+                TArray<FVector2D> Outer2D;
+                Outer2D.Reserve(LocalFootprint.Num());
+                for (const FVector& V : LocalFootprint) Outer2D.Add(FVector2D(V.X, V.Y));
 
-                AddPolygonTriangulated(OutRoofData, InnerFP, RoofZ, RoofFColor);
-                AddExtrudedPolygon(OutRoofData, LocalFootprint, WallTopZ, ParapetTop, RoofFColor, false);
-                AddExtrudedPolygon(OutRoofData, InnerFP, RoofZ, ParapetTop, RoofFColor, false);
+                TArray<int32> Tris;
+                TArray<FVector2D> Steiner;
+                FCGALSkeletonGenerator::TriangulateWithCGAL(Outer2D, Holes, Tris, Steiner);
 
-                int32 NP = LocalFootprint.Num();
-                for (int32 i = 0; i < NP; i++)
+                if (Tris.Num() >= 3)
                 {
-                        int32 Next = (i + 1) % NP;
-                        FVector O0(LocalFootprint[i].X, LocalFootprint[i].Y, ParapetTop);
-                        FVector O1(LocalFootprint[Next].X, LocalFootprint[Next].Y, ParapetTop);
-                        FVector I1(InnerFP[Next].X, InnerFP[Next].Y, ParapetTop);
-                        FVector I0(InnerFP[i].X, InnerFP[i].Y, ParapetTop);
-                        AddQuad(OutRoofData, O0, O1, I1, I0, RoofFColor);
+                        TArray<FVector2D> All;
+                        All.Reserve(Outer2D.Num() + Steiner.Num());
+                        All.Append(Outer2D);
+                        All.Append(Steiner);
+
+                        // Flat-roof UVs: stretch ONE texture across the whole
+                        // building footprint, oriented to the building's principal
+                        // axis (its longest footprint edge), so the texture's U/V
+                        // run parallel to the walls (the building's right-angle
+                        // frame) instead of along world X/Y. Mirrors streets-gl's
+                        // stretched FlatRoofBuilder (oriented bounding box).
+                        FVector2D Dir(1.f, 0.f);
+                        {
+                                float BestLen = -1.f;
+                                const int32 N = Outer2D.Num();
+                                for (int32 i = 0; i < N; ++i)
+                                {
+                                        const FVector2D Edge = Outer2D[(i + 1) % N] - Outer2D[i];
+                                        const float L = Edge.SizeSquared();
+                                        if (L > BestLen) { BestLen = L; Dir = Edge; }
+                                }
+                                if (!Dir.Normalize()) Dir = FVector2D(1.f, 0.f);
+                        }
+                        const FVector2D Perp(-Dir.Y, Dir.X);
+
+                        // Oriented bounding box of the footprint in (Dir, Perp).
+                        float UMin = FLT_MAX, UMax = -FLT_MAX, VMin = FLT_MAX, VMax = -FLT_MAX;
+                        for (const FVector2D& P : Outer2D)
+                        {
+                                const float U = FVector2D::DotProduct(P, Dir);
+                                const float V = FVector2D::DotProduct(P, Perp);
+                                UMin = FMath::Min(UMin, U); UMax = FMath::Max(UMax, U);
+                                VMin = FMath::Min(VMin, V); VMax = FMath::Max(VMax, V);
+                        }
+                        const float USize = FMath::Max(UMax - UMin, 1.f);
+                        const float VSize = FMath::Max(VMax - VMin, 1.f);
+
+                        const int32 Base = OutRoofData.Vertices.Num();
+                        for (const FVector2D& P : All)
+                        {
+                                OutRoofData.Vertices.Add(FVector(P.X, P.Y, RoofZ));
+                                OutRoofData.Normals.Add(FVector(0, 0, 1));
+                                OutRoofData.VertexColors.Add(RoofFColor);
+                                OutRoofData.Tangents.Add(FProcMeshTangent(FVector(Dir.X, Dir.Y, 0.f), false));
+                                const float U = (FVector2D::DotProduct(P, Dir) - UMin) / USize;
+                                const float V = (FVector2D::DotProduct(P, Perp) - VMin) / VSize;
+                                OutRoofData.UV0.Add(FVector2D(U, V));
+                        }
+                        for (int32 T : Tris) OutRoofData.Triangles.Add(Base + T);
+                }
+                else
+                {
+                        AddPolygonTriangulated(OutRoofData, LocalFootprint, RoofZ, RoofFColor);
                 }
         }
         break;
@@ -734,36 +1150,35 @@ void FGeoMeshGenerator::AddRoofGeometry(
         case ERoofShape::Gabled:
         case ERoofShape::Saltbox:
         case ERoofShape::QuadrupleSaltbox:
-                if (bUseCGALSkeleton)
-                        AddSkeletonGabledRoof(OutRoofData, LocalFootprint, WallTopZ, RoofH, RoofFColor);
-                else
-                        AddGabledRoof(OutRoofData, LocalFootprint, WallTopZ, RoofH, RoofFColor);
+        case ERoofShape::CrossGabled:
+                // CGAL straight-skeleton roof first; gabled skeleton as fallback.
+                if (!AddStraightSkeletonRoof(OutRoofData, LocalFootprint, WallTopZ, RoofH, RoofFColor, Holes))
+                        AddSkeletonGabledRoof(OutRoofData, LocalFootprint, WallTopZ, RoofH, RoofFColor, Holes, RoofDirection, RoofOrientation);
                 break;
 
         case ERoofShape::Hipped:
-                if (bUseCGALSkeleton)
-                        AddSkeletonHippedRoof(OutRoofData, LocalFootprint, WallTopZ, RoofH, RoofFColor);
-                else
-                        AddHippedRoof(OutRoofData, LocalFootprint, WallTopZ, RoofH, RoofFColor);
-                break;
-
+        case ERoofShape::HalfHipped:
         case ERoofShape::Pyramidal:
-                if (bUseCGALSkeleton)
-                        AddSkeletonHippedRoof(OutRoofData, LocalFootprint, WallTopZ, RoofH, RoofFColor);
-                else
-                        AddPyramidalRoof(OutRoofData, LocalFootprint, WallTopZ, RoofH, RoofFColor);
+                // CGAL straight-skeleton roof first; pyramid/hipped skeleton as fallback.
+                if (!AddStraightSkeletonRoof(OutRoofData, LocalFootprint, WallTopZ, RoofH, RoofFColor, Holes))
+                {
+                        if (RoofShape == ERoofShape::Pyramidal)
+                                AddPyramidalRoof(OutRoofData, LocalFootprint, WallTopZ, RoofH, RoofFColor);
+                        else
+                                AddSkeletonHippedRoof(OutRoofData, LocalFootprint, WallTopZ, RoofH, RoofFColor, Holes);
+                }
                 break;
 
         case ERoofShape::Skillion:
-                AddSkillionRoof(OutRoofData, LocalFootprint, WallTopZ, RoofH, RoofFColor);
+                AddSkillionRoof(OutRoofData, LocalFootprint, WallTopZ, RoofH, RoofFColor, RoofDirection);
                 break;
 
         case ERoofShape::Mansard:
+                AddSkeletonMansardRoof(OutRoofData, LocalFootprint, WallTopZ, RoofH, RoofFColor);
+                break;
+
         case ERoofShape::Gambrel:
-                if (bUseCGALSkeleton)
-                        AddSkeletonMansardRoof(OutRoofData, LocalFootprint, WallTopZ, RoofH, RoofFColor);
-                else
-                        AddMansardRoof(OutRoofData, LocalFootprint, WallTopZ, RoofH, RoofFColor);
+                AddGambrelRoof(OutRoofData, LocalFootprint, WallTopZ, RoofH, RoofFColor, RoofDirection);
                 break;
 
         case ERoofShape::Dome:
@@ -773,197 +1188,11 @@ void FGeoMeshGenerator::AddRoofGeometry(
         case ERoofShape::Onion:
                 AddDomeRoof(OutRoofData, LocalFootprint, WallTopZ, RoofH, RoofFColor, true);
                 break;
+
+        case ERoofShape::Round:
+                AddRoundRoof(OutRoofData, LocalFootprint, WallTopZ, RoofH, RoofFColor, RoofDirection, RoofOrientation, WallColor);
+                break;
         }
-}
-
-// ============================================================================
-// AddGabledRoof - streets.gl approach
-// Algorithm:
-// 1. Clean footprint (remove dupes, ensure CCW)
-// 2. Compute AABB bounds, determine if longer along X or Y
-// 3. Define ridge ray: from AABB center, perpendicular to longer axis
-// 4. Call SplitPolygon2D to split into two halves
-// 5. If split fails, fall back to simple quad-based approach
-// 6. For each sub-polygon: triangulate with TriangulatePolygon2D,
-//    then assign vertex heights based on SignedDistanceToLine
-// ============================================================================
-void FGeoMeshGenerator::AddGabledRoof(
-        FMeshData& OutData, const TArray<FVector>& FP,
-        float BaseZ, float RidgeH, const FColor& Color)
-{
-        if (FP.Num() < 3) return;
-
-        // Clean and ensure CCW
-        TArray<FVector> CleanFP;
-        for (const FVector& V : FP)
-        {
-                FVector P(V.X, V.Y, BaseZ);
-                if (CleanFP.Num() > 0 && P.Equals(CleanFP.Last(), 0.5f)) continue;
-                if (CleanFP.Num() > 0 && P.Equals(CleanFP[0], 0.5f)) continue;
-                CleanFP.Add(P);
-        }
-        if (CleanFP.Num() < 3) return;
-        if (ComputeSignedArea2D(CleanFP) < 0.f) Algo::Reverse(CleanFP);
-
-        float MinX, MaxX, MinY, MaxY;
-        ComputeFootprintBounds(CleanFP, MinX, MaxX, MinY, MaxY);
-        float CX = (MinX + MaxX) * 0.5f, CY = (MinY + MaxY) * 0.5f;
-        bool bLongX = IsLongerAlongX(CleanFP);
-
-        // 2D polygon for split
-        TArray<FVector2D> Poly2D;
-        for (const FVector& V : CleanFP)
-                Poly2D.Add(FVector2D(V.X, V.Y));
-
-        // Ridge ray: from AABB center, perpendicular to longer axis
-        FVector2D RayOrig, RayDir;
-        if (bLongX) { RayOrig = FVector2D(CX, CY); RayDir = FVector2D(0.f, 1.f); }
-        else        { RayOrig = FVector2D(CX, CY); RayDir = FVector2D(1.f, 0.f); }
-
-        // Split polygon along ridge line
-        TArray<TArray<FVector2D>> SubPolygons;
-        bool bSplitOK = SplitPolygon2D(Poly2D, RayOrig, RayDir, SubPolygons);
-
-        if (!bSplitOK || SubPolygons.Num() < 2)
-        {
-                // Fallback: simple quad-based approach
-                int32 NC = CleanFP.Num();
-                float RidgeZ = BaseZ + RidgeH;
-                for (int32 i = 0; i < NC; i++)
-                {
-                        int32 Next = (i + 1) % NC;
-                        const FVector& A = CleanFP[i];
-                        const FVector& B = CleanFP[Next];
-
-                        float AX, AY, BX, BY;
-                        if (bLongX) { AX = A.X; AY = CY; BX = B.X; BY = CY; }
-                        else        { AX = CX; AY = A.Y; BX = CX; BY = B.Y; }
-
-                        FVector RA(AX, AY, RidgeZ);
-                        FVector RB(BX, BY, RidgeZ);
-
-                        if (RA.Equals(RB, 1.f))
-                        {
-                                if (!A.Equals(RA, 1.f) && !B.Equals(RB, 1.f))
-                                        AddTriangle(OutData, A, B, RA, Color);
-                        }
-                        else
-                        {
-                                if (A.Equals(RA, 1.f)) AddTriangle(OutData, B, RB, A, Color);
-                                else if (B.Equals(RB, 1.f)) AddTriangle(OutData, A, B, RA, Color);
-                                else AddQuad(OutData, A, B, RB, RA, Color);
-                        }
-                }
-                return;
-        }
-
-        // Ridge line as distance reference
-        FVector2D RidgeA, RidgeB;
-        if (bLongX) { RidgeA = FVector2D(MinX, CY); RidgeB = FVector2D(MaxX, CY); }
-        else        { RidgeA = FVector2D(CX, MinY); RidgeB = FVector2D(CX, MaxY); }
-
-        // Max distance from ridge line
-        float MaxDist = 0.f;
-        for (const FVector& V : CleanFP)
-        {
-                float D = FMath::Abs(SignedDistanceToLine(FVector2D(V.X, V.Y), RidgeA, RidgeB));
-                if (D > MaxDist) MaxDist = D;
-        }
-        if (MaxDist < 1.f) MaxDist = 1.f;
-
-        // For each sub-polygon: triangulate + assign heights
-        for (const TArray<FVector2D>& SubPoly : SubPolygons)
-        {
-                if (SubPoly.Num() < 3) continue;
-
-                TArray<int32> Triangles;
-                TriangulatePolygon2D(SubPoly, Triangles);
-
-                int32 BaseIdx = OutData.Vertices.Num();
-
-                for (const FVector2D& V2D : SubPoly)
-                {
-                        float Dist = SignedDistanceToLine(V2D, RidgeA, RidgeB);
-                        float NormalizedDist = FMath::Abs(Dist) / MaxDist;
-                        float VertexZ = BaseZ + RidgeH * (1.f - NormalizedDist);
-
-                        OutData.Vertices.Add(FVector(V2D.X, V2D.Y, VertexZ));
-                        OutData.Normals.Add(FVector(0.f, 0.f, 1.f));
-                        OutData.VertexColors.Add(Color);
-                        OutData.Tangents.Add(FProcMeshTangent(FVector(1, 0, 0), false));
-                        OutData.UV0.Add(FVector2D(V2D.X / 100.f, V2D.Y / 100.f));
-                }
-
-                for (int32 TriIdx : Triangles)
-                        OutData.Triangles.Add(BaseIdx + TriIdx);
-        }
-}
-
-// ============================================================================
-// AddHippedRoof - streets.gl approach
-// Algorithm:
-// 1. Clean footprint, compute AABB
-// 2. Triangulate entire footprint with TriangulatePolygon2D
-// 3. Assign vertex heights based on signed distance from ridge line
-// 4. Height = BaseZ + RidgeH * (1.0 - abs(Dist) / MaxDist)
-// ============================================================================
-void FGeoMeshGenerator::AddHippedRoof(
-        FMeshData& OutData, const TArray<FVector>& FP,
-        float BaseZ, float RidgeH, const FColor& Color)
-{
-        if (FP.Num() < 3) return;
-
-        TArray<FVector> CleanFP;
-        for (const FVector& V : FP)
-        {
-                if (CleanFP.Num() > 0 && FVector(V.X, V.Y, BaseZ).Equals(CleanFP[0], 0.5f)) continue;
-                CleanFP.Add(FVector(V.X, V.Y, BaseZ));
-        }
-        if (CleanFP.Num() < 3) return;
-        if (ComputeSignedArea2D(CleanFP) < 0.f) Algo::Reverse(CleanFP);
-
-        float MinX, MaxX, MinY, MaxY;
-        ComputeFootprintBounds(CleanFP, MinX, MaxX, MinY, MaxY);
-        float CX = (MinX + MaxX) * 0.5f, CY = (MinY + MaxY) * 0.5f;
-        float DX = (MaxX - MinX), DY = (MaxY - MinY);
-        bool bLongX = (DX >= DY);
-
-        FVector2D RidgeA, RidgeB;
-        if (bLongX) { RidgeA = FVector2D(MinX, CY); RidgeB = FVector2D(MaxX, CY); }
-        else        { RidgeA = FVector2D(CX, MinY); RidgeB = FVector2D(CX, MaxY); }
-
-        float MaxDist = 0.f;
-        for (const FVector& V : CleanFP)
-        {
-                float D = FMath::Abs(SignedDistanceToLine(FVector2D(V.X, V.Y), RidgeA, RidgeB));
-                if (D > MaxDist) MaxDist = D;
-        }
-        if (MaxDist < 1.f) MaxDist = 1.f;
-
-        TArray<FVector2D> Poly2D;
-        for (const FVector& V : CleanFP)
-                Poly2D.Add(FVector2D(V.X, V.Y));
-
-        TArray<int32> Triangles;
-        TriangulatePolygon2D(Poly2D, Triangles);
-
-        int32 BaseIdx = OutData.Vertices.Num();
-
-        for (const FVector2D& V2D : Poly2D)
-        {
-                float Dist = FMath::Abs(SignedDistanceToLine(V2D, RidgeA, RidgeB));
-                float NormalizedDist = Dist / MaxDist;
-                float VertexZ = BaseZ + RidgeH * (1.f - NormalizedDist);
-
-                OutData.Vertices.Add(FVector(V2D.X, V2D.Y, VertexZ));
-                OutData.Normals.Add(FVector(0.f, 0.f, 1.f));
-                OutData.VertexColors.Add(Color);
-                OutData.Tangents.Add(FProcMeshTangent(FVector(1, 0, 0), false));
-                OutData.UV0.Add(FVector2D(V2D.X / 100.f, V2D.Y / 100.f));
-        }
-
-        for (int32 TriIdx : Triangles)
-                OutData.Triangles.Add(BaseIdx + TriIdx);
 }
 
 // ============================================================================
@@ -1005,9 +1234,47 @@ void FGeoMeshGenerator::AddPyramidalRoof(
 // ============================================================================
 void FGeoMeshGenerator::AddSkillionRoof(
         FMeshData& OutData, const TArray<FVector>& FP,
-        float BaseZ, float RidgeH, const FColor& Color)
+        float BaseZ, float RidgeH, const FColor& Color,
+        float RoofDirection)
 {
         if (FP.Num() < 3) return;
+
+        if (RoofDirection >= 0.f)
+        {
+                // Match streets-gl SkillionRoofBuilder.getRotation:
+                //   rotation = -toRad(direction) - PI/2, slope-up = (-cos D, -sin D).
+                // OSM roof:direction is the downslope azimuth (clockwise from north).
+                // In local space X=east, Y=-north, so the upslope (toward the high edge)
+                // is (-sin D, cos D). MaxProj = high edge, MinProj = low edge.
+                float D_rad = FMath::DegreesToRadians(RoofDirection);
+                FVector2D SlopeDir(-FMath::Sin(D_rad), FMath::Cos(D_rad));
+
+                float MinProj = FLT_MAX, MaxProj = -FLT_MAX;
+                for (const FVector& V : FP)
+                {
+                        float Proj = V.X * SlopeDir.X + V.Y * SlopeDir.Y;
+                        MinProj = FMath::Min(MinProj, Proj);
+                        MaxProj = FMath::Max(MaxProj, Proj);
+                }
+                float Range = FMath::Max(MaxProj - MinProj, 1.f);
+
+                TArray<FVector> SlopedFP;
+                for (const FVector& V : FP)
+                {
+                        float Proj = V.X * SlopeDir.X + V.Y * SlopeDir.Y;
+                        float T = (Proj - MinProj) / Range; // T=0 -> low edge (faces roof:direction), T=1 -> high edge
+                        // OSM roof:direction points toward the LOW eaves. SlopeDir is
+                        // built along that direction, so MinProj is the low edge and
+                        // must sit on the wall top (Z=BaseZ); the high edge reaches
+                        // BaseZ+RidgeH. The old Lerp(RidgeH,0,T) inverted this, lifting
+                        // the low eaves into the air (detached, upward-tilted roof).
+                        float Z = BaseZ + FMath::Lerp(0.f, RidgeH, T);
+                        SlopedFP.Add(FVector(V.X, V.Y, Z));
+                }
+                AddPolygonTriangulated(OutData, SlopedFP, 0.f, Color, true);
+                return;
+        }
+
         float MinX, MaxX, MinY, MaxY;
         ComputeFootprintBounds(FP, MinX, MaxX, MinY, MaxY);
 
@@ -1021,7 +1288,8 @@ void FGeoMeshGenerator::AddSkillionRoof(
                         T = (MaxY > MinY) ? (V.Y - MinY) / (MaxY - MinY) : 0.f;
                 else
                         T = (MaxX > MinX) ? (V.X - MinX) / (MaxX - MinX) : 0.f;
-                float Z = BaseZ + FMath::Lerp(RidgeH, 0.f, T);
+                // Low edge (T=0) sits on the wall top; high edge (T=1) at BaseZ+RidgeH.
+                float Z = BaseZ + FMath::Lerp(0.f, RidgeH, T);
                 SlopedFP.Add(FVector(V.X, V.Y, Z));
         }
         AddPolygonTriangulated(OutData, SlopedFP, 0.f, Color, true);
@@ -1053,7 +1321,20 @@ void FGeoMeshGenerator::AddMansardRoof(
 }
 
 // ============================================================================
-// AddDomeRoof - parametric dome with rings and segments
+// AddDomeRoof - smooth hemisphere with shared vertices and analytical normals.
+//
+// Uses many angular segments (independent of base polygon complexity) so the
+// dome surface is smooth regardless of whether the base is a quad or octagon.
+// Vertices are shared between adjacent quads so Gouraud shading interpolates
+// normals across the surface without stepped lighting bands.
+//
+// Algorithm:
+//   1. Cast a ray from the AABB centre at each angular sample to find the
+//      base-polygon boundary radius at that angle.
+//   2. Scale that radius by cos(Phi) per ring to project onto the ellipsoid.
+//   3. Z = BaseZ + DomeH * sin(Phi).
+//   4. Normals are the ellipsoid gradient (analytical, smooth).
+//   5. For bOnion: radius scale = cos(Phi) * (1 + 0.8 * sin(Phi)) to bulge mid.
 // ============================================================================
 void FGeoMeshGenerator::AddDomeRoof(
         FMeshData& OutData, const TArray<FVector>& FP,
@@ -1061,53 +1342,569 @@ void FGeoMeshGenerator::AddDomeRoof(
         bool bOnion)
 {
         if (FP.Num() < 3) return;
-        FVector Cen = ComputePolygonCentroid(FP);
+
+        // Clean footprint, ensure CCW.
+        TArray<FVector> CleanFP;
+        for (const FVector& V : FP)
+        {
+                FVector P(V.X, V.Y, BaseZ);
+                if (CleanFP.Num() > 0 && P.Equals(CleanFP.Last(), 0.5f)) continue;
+                if (CleanFP.Num() > 0 && P.Equals(CleanFP[0], 0.5f)) continue;
+                CleanFP.Add(P);
+        }
+        if (CleanFP.Num() < 3) return;
+        if (ComputeSignedArea2D(CleanFP) < 0.f) Algo::Reverse(CleanFP);
+
         float MinX, MaxX, MinY, MaxY;
-        ComputeFootprintBounds(FP, MinX, MaxX, MinY, MaxY);
-        float RadX = (MaxX - MinX) * 0.5f, RadY = (MaxY - MinY) * 0.5f;
+        ComputeFootprintBounds(CleanFP, MinX, MaxX, MinY, MaxY);
+        const FVector2D Cen2D((MinX + MaxX) * 0.5f, (MinY + MaxY) * 0.5f);
+        const float RadX = FMath::Max((MaxX - MinX) * 0.5f, 1.f);
+        const float RadY = FMath::Max((MaxY - MinY) * 0.5f, 1.f);
+        const int32 N = CleanFP.Num();
 
-        const int32 Rings = 8;
-        const int32 Segments = FMath::Max(16, FP.Num() * 2);
+        // Ray from centre → polygon boundary at angle Theta.
+        auto PolygonRadius = [&](float Theta) -> float
+        {
+                FVector2D Dir(FMath::Cos(Theta), FMath::Sin(Theta));
+                float Best = FLT_MAX;
+                for (int32 i = 0; i < N; i++)
+                {
+                        FVector2D A(CleanFP[i].X - Cen2D.X, CleanFP[i].Y - Cen2D.Y);
+                        FVector2D B(CleanFP[(i + 1) % N].X - Cen2D.X, CleanFP[(i + 1) % N].Y - Cen2D.Y);
+                        FVector2D AB = B - A;
+                        float Denom = Dir.X * AB.Y - Dir.Y * AB.X;
+                        if (FMath::Abs(Denom) < 1e-6f) continue;
+                        float t = (A.X * AB.Y - A.Y * AB.X) / Denom;
+                        float s = -(Dir.X * A.Y - Dir.Y * A.X) / Denom;
+                        if (t > 0.f && s >= -0.001f && s <= 1.001f)
+                                Best = FMath::Min(Best, t);
+                }
+                return (Best < FLT_MAX) ? Best : FMath::Max(RadX, RadY);
+        };
 
-        TArray<TArray<FVector>> RingVerts;
+        // More segments = smoother silhouette; independent of base polygon vertex count.
+        const int32 Segments = FMath::Max(32, N * 6);
+        // Onion needs more rings so the slender spire/neck near the top is not faceted.
+        const int32 Rings    = bOnion ? 28 : 16;
+
+        // Width blend for onion silhouette: 0 = narrow/slender bulb (towers),
+        // 1 = wide bulb (entrance). Driven by the SCALE-INVARIANT aspect ratio
+        // (half short side / dome height) so it is independent of world units:
+        // narrow tower bulbs measure ~0.39, wide entrance bulbs ~0.69. Narrow
+        // bulbs stay slender; wide bulbs get a taller belly and a sharper,
+        // shorter tip so a broad bulb does not look squashed.
+        const float OnionHalfShort = FMath::Min(RadX, RadY);
+        const float OnionAspect = (DomeH > 1.f) ? (OnionHalfShort / DomeH) : 0.39f;
+        const float OnionWBlend = FMath::Clamp((OnionAspect - 0.39f) / (0.69f - 0.39f), 0.f, 1.f);
+
+        // -----------------------------------------------------------------------
+        // Profile function — returns { heightFrac (0..1), radScale } for ring t in [0,1].
+        //
+        // Onion: a classic *ogee* (S-shaped) cross-section instead of a single
+        // sinusoid.  The silhouette is defined by hand-tuned control points
+        // (heightFrac : radScale) smoothly interpolated with Catmull-Rom:
+        //
+        //   - springs from the drum at radScale = 1.0
+        //   - bulges out gently to ~1.20x at ~20% height (the "belly")
+        //   - curves back inward through an S inflection in the mid section
+        //   - pinches to a slender neck (~0.13x) around 90% height
+        //   - draws out to a fine point at the apex
+        //
+        // The control points are denser near the top so the spire gets more rings
+        // and stays smooth.  Same profile is used for every base polygon (no
+        // special case for quads) — the footprint shape is handled separately by
+        // PolygonRadius(), so a square base produces a square-belly onion and an
+        // octagon a round one, both with the correct ogee silhouette.
+        //
+        // Dome (non-onion): plain hemisphere — sinP / cosP of t*PI/2.
+        // -----------------------------------------------------------------------
+        auto ProfileAt = [&](float t) -> TPair<float, float>
+        {
+                if (bOnion)
+                {
+                        // Two ogee onion silhouettes (heightFrac : radScale), blended by
+                        // bulb width via OnionWBlend. Both share the classic shape: plump
+                        // belly low down, a concave waist, then a slender drawn-out finial.
+                        //
+                        //  NARROW (tower bulb): slender, belly to ~38% height, fine tip.
+                        //  WIDE  (entrance bulb): belly pushed taller (to ~45% height) so a
+                        //    broad bulb does not look squashed, and the tip is thinner and
+                        //    SHORTER (compressed into the top), giving a sharper point.
+                        static const float Hn[] = { 0.00f, 0.07f, 0.18f, 0.28f, 0.38f, 0.47f, 0.56f, 0.64f, 0.72f, 0.80f, 0.87f, 0.94f, 1.00f };
+                        static const float Rn[] = { 1.00f, 1.14f, 1.23f, 1.20f, 1.05f, 0.78f, 0.50f, 0.31f, 0.19f, 0.11f, 0.060f, 0.025f, 0.00f };
+                        static const float Hw[] = { 0.00f, 0.09f, 0.22f, 0.34f, 0.45f, 0.55f, 0.63f, 0.71f, 0.78f, 0.84f, 0.90f, 0.95f, 1.00f };
+                        static const float Rw[] = { 1.00f, 1.16f, 1.26f, 1.23f, 1.08f, 0.78f, 0.46f, 0.26f, 0.14f, 0.075f, 0.035f, 0.013f, 0.00f };
+                        const int32 M = 13;
+
+                        float  c = FMath::Clamp(t, 0.f, 1.f) * (float)(M - 1);
+                        int32  i = FMath::Clamp((int32)c, 0, M - 2);
+                        float  f = c - (float)i;
+
+                        // Catmull-Rom interpolation of a control array at local param f
+                        // within segment [i, i+1], clamping the outer tangent points.
+                        auto CR = [&](const float* A) -> float
+                        {
+                                float p0 = A[FMath::Max(i - 1, 0)];
+                                float p1 = A[i];
+                                float p2 = A[i + 1];
+                                float p3 = A[FMath::Min(i + 2, M - 1)];
+                                float f2 = f * f, f3 = f2 * f;
+                                return 0.5f * ((2.f * p1)
+                                        + (-p0 + p2) * f
+                                        + (2.f * p0 - 5.f * p1 + 4.f * p2 - p3) * f2
+                                        + (-p0 + 3.f * p1 - 3.f * p2 + p3) * f3);
+                        };
+
+                        float h = FMath::Lerp(CR(Hn), CR(Hw), OnionWBlend);
+                        float r = FMath::Lerp(CR(Rn), CR(Rw), OnionWBlend);
+                        return { FMath::Clamp(h, 0.f, 1.f), FMath::Max(r, 0.f) };
+                }
+
+                // Hemisphere dome.
+                float Phi = t * PI * 0.5f;
+                return { FMath::Sin(Phi), FMath::Cos(Phi) };
+        };
+
+        // Determine which segment columns sit on a footprint vertex.
+        // A segment s is a "seam" column if its angle Theta_s is within a small
+        // tolerance of the angle from the centroid to any footprint vertex.
+        // At seam columns the vertex is duplicated so the two flanking face-groups
+        // get independent normals → hard crease.  All other columns are shared
+        // → smooth interpolation across rings and across non-seam segment boundaries.
+        //
+        // This gives exactly N sharp ridges (one per footprint edge) rising from
+        // the footprint corners to the apex, while the dome surface between ridges
+        // is perfectly smooth.
+        // -----------------------------------------------------------------------
+
+        // Precompute the angle of each footprint vertex from the centroid.
+        TArray<float> FootprintAngles;
+        FootprintAngles.Reserve(N);
+        for (int32 i = 0; i < N; i++)
+        {
+                float Ax = CleanFP[i].X - Cen2D.X;
+                float Ay = CleanFP[i].Y - Cen2D.Y;
+                FootprintAngles.Add(FMath::Atan2(Ay, Ax));  // [-PI, PI]
+        }
+
+        // For each footprint vertex, find the single nearest segment column index.
+        // That column (and only that column) becomes a seam — exactly N seams total.
+        // Also store the exact footprint vertex position for snapping RingPts.
+        TSet<int32>             SeamSet;
+        TMap<int32, FVector2D>  SeamSnap;   // column s → exact footprint vertex XY
+        for (int32 i = 0; i < N; i++)
+        {
+                float FA    = FootprintAngles[i];
+                float Angle = FA < 0.f ? FA + 2.f * PI : FA;
+
+                float ExactS   = Angle / (2.f * PI) * (float)Segments;
+                int32 NearestS = FMath::RoundToInt(ExactS) % Segments;
+                SeamSet.Add(NearestS);
+                // Store the footprint vertex centroid-relative position.
+                SeamSnap.Add(NearestS, FVector2D(
+                        CleanFP[i].X - Cen2D.X,
+                        CleanFP[i].Y - Cen2D.Y));
+        }
+
+        // Returns true only for the one segment column that is closest to a footprint vertex.
+        auto IsSeamColumn = [&](int32 s) -> bool
+        {
+                return SeamSet.Contains(s);
+        };
+
+        // Pre-compute ring vertex positions.
+        TArray<TArray<FVector>> RingPts;
+        RingPts.SetNum(Rings + 1);
         for (int32 r = 0; r <= Rings; r++)
         {
-                float T = (float)r / (float)Rings;
-                float Phi = T * PI * 0.5f;
-                float sinPhi = FMath::Sin(Phi);
-                float cosPhi = FMath::Cos(Phi);
+                float t = (float)r / (float)Rings;
+                auto [sinP, radScale] = ProfileAt(t);
 
-                float ScaleR = bOnion ? (cosPhi * (1.f + 0.3f * sinPhi)) : cosPhi;
-
-                TArray<FVector> Ring;
+                RingPts[r].SetNum(Segments);
                 for (int32 s = 0; s < Segments; s++)
                 {
                         float Theta = 2.f * PI * (float)s / (float)Segments;
-                        float X = Cen.X + RadX * ScaleR * FMath::Cos(Theta);
-                        float Y = Cen.Y + RadY * ScaleR * FMath::Sin(Theta);
-                        float Z = BaseZ + DomeH * sinPhi;
-                        Ring.Add(FVector(X, Y, Z));
+                        float X, Y;
+
+                        if (const FVector2D* Snap = SeamSnap.Find(s))
+                        {
+                                // Seam column: at r=0 land exactly on the footprint vertex.
+                                // For higher rings, scale the XY radially by the same radScale
+                                // factor relative to the footprint radius at this angle.
+                                float BaseR = Snap->Size();   // distance from centroid to fp vertex
+                                float ScaledR = BaseR * radScale;
+                                FVector2D Dir = BaseR > 0.f
+                                        ? (*Snap / BaseR)
+                                        : FVector2D(FMath::Cos(Theta), FMath::Sin(Theta));
+                                X = Cen2D.X + Dir.X * ScaledR;
+                                Y = Cen2D.Y + Dir.Y * ScaledR;
+                        }
+                        else
+                        {
+                                float R = PolygonRadius(Theta) * radScale;
+                                X = Cen2D.X + FMath::Cos(Theta) * R;
+                                Y = Cen2D.Y + FMath::Sin(Theta) * R;
+                        }
+
+                        RingPts[r][s] = FVector(X, Y, BaseZ + DomeH * sinP);
                 }
-                RingVerts.Add(Ring);
         }
 
-        for (int32 r = 0; r < Rings; r++)
+        const FVector Apex(Cen2D.X, Cen2D.Y, BaseZ + DomeH);
+
+        // -----------------------------------------------------------------------
+        // Smooth normal from the *actual* meridian slope of the profile.
+        //
+        // Along a meridian the surface point is ( R(t), Z(t) ) in the (radial,
+        // vertical) plane, with R(t) = RadRef * radScale(t) and Z(t) = DomeH *
+        // heightFrac(t).  The outward surface normal in that plane is the meridian
+        // tangent (dR, dZ) rotated by -90°  →  (dZ, -dR).  In 3D this becomes
+        //   N = ( dZ·cosθ, dZ·sinθ, -dR ).
+        // Derivatives are taken by central finite difference of ProfileAt, so the
+        // shading matches whatever silhouette the control points describe — this
+        // correctly tilts the normal *downward* under the onion's belly (where the
+        // radius grows with height) and steep near the spire.  For the plain
+        // hemisphere it reduces to the usual cosΦ/sinΦ normal.
+        // -----------------------------------------------------------------------
+        const float RadRef = FMath::Max(FMath::Max(RadX, RadY), 1.f);
+
+        auto ProfileNormal = [&](float Theta, float t) -> FVector
         {
-                const TArray<FVector>& Bottom = RingVerts[r];
-                const TArray<FVector>& Top = RingVerts[r + 1];
-                for (int32 s = 0; s < Segments; s++)
-                {
-                        int32 sn = (s + 1) % Segments;
-                        AddQuad(OutData, Bottom[s], Bottom[sn], Top[sn], Top[s], Color);
-                }
-        }
+                const float dt = 0.0015f;
+                auto P0 = ProfileAt(FMath::Max(t - dt, 0.f));
+                auto P1 = ProfileAt(FMath::Min(t + dt, 1.f));
+                float dR = (P1.Value - P0.Value) * RadRef;   // radScale → radius
+                float dZ = (P1.Key   - P0.Key)   * DomeH;    // heightFrac → height
 
-        FVector Apex(Cen.X, Cen.Y, BaseZ + DomeH);
-        const TArray<FVector>& LastRing = RingVerts[Rings];
+                FVector Nrm(dZ * FMath::Cos(Theta), dZ * FMath::Sin(Theta), -dR);
+                if (Nrm.IsNearlyZero()) Nrm = FVector(0, 0, 1);
+                Nrm.Normalize();
+                return Nrm;
+        };
+
+        // -----------------------------------------------------------------------
+        // Build vertex buffer.
+        //
+        // We assign one logical "slot" per (ring, segment-column).  Non-seam
+        // columns have a single slot shared by both flanking panels.  Seam
+        // columns have TWO slots: one carrying the right-panel normal, one the
+        // left-panel normal.  The slot index array ColIdx[s] gives the buffer
+        // index of column s for the LEADING (left) side of panel s; the trailing
+        // (right) side of panel s-1 may differ at a seam.
+        //
+        // Layout in OutData (starting at VBase):
+        //   For each ring r (0..Rings):
+        //     For each segment column s (0..Segments-1):
+        //       Primary slot   (always present)         → used as LEFT  side of panel s
+        //       Secondary slot (seam columns only)      → used as RIGHT side of panel s-1
+        //   Apex slot at the end.
+        //
+        // We store the buffer offsets in two arrays:
+        //   PrimarySlot[s]   = buffer index of primary   slot for column s, ring r=0
+        //                      (add r*(total columns per ring) for ring r)
+        //   SecondarySlot[s] = buffer index of secondary slot for column s, ring r=0
+        //                      equals PrimarySlot[s] for non-seam columns (shared)
+        // -----------------------------------------------------------------------
+
+        // Count total columns per ring (seam columns contribute 2, others 1).
+        int32 ColsPerRing = 0;
+        TArray<int32> PrimaryOff;   PrimaryOff.SetNum(Segments);
+        TArray<int32> SecondaryOff; SecondaryOff.SetNum(Segments);
+        TArray<bool>  bSeam;        bSeam.SetNum(Segments);
         for (int32 s = 0; s < Segments; s++)
         {
+                PrimaryOff[s]   = ColsPerRing;
+                bSeam[s]        = IsSeamColumn(s);
+                SecondaryOff[s] = ColsPerRing + (bSeam[s] ? 1 : 0);
+                ColsPerRing    += bSeam[s] ? 2 : 1;
+        }
+        const int32 TotalRingVerts = ColsPerRing * (Rings + 1);
+
+        int32 VBase    = OutData.Vertices.Num();
+        int32 ApexSlot = VBase + TotalRingVerts;
+
+        // Pre-allocate to avoid repeated reallocs.
+        int32 TotalVerts = TotalRingVerts + 1;  // +1 apex
+        OutData.Vertices.Reserve(   OutData.Vertices.Num()    + TotalVerts);
+        OutData.Normals.Reserve(    OutData.Normals.Num()      + TotalVerts);
+        OutData.VertexColors.Reserve(OutData.VertexColors.Num()+ TotalVerts);
+        OutData.UV0.Reserve(        OutData.UV0.Num()          + TotalVerts);
+        OutData.Tangents.Reserve(   OutData.Tangents.Num()     + TotalVerts);
+
+        // Emit ring vertices.
+        for (int32 r = 0; r <= Rings; r++)
+        {
+                float tRing  = (float)r / (float)Rings;
+
+                for (int32 s = 0; s < Segments; s++)
+                {
+                        float Theta = 2.f * PI * (float)s / (float)Segments;
+                        FVector  Pos = RingPts[r][s];
+                        FVector  Nrm = ProfileNormal(Theta, tRing);
+                        FVector  Tang(-FMath::Sin(Theta), FMath::Cos(Theta), 0.f);
+                        FVector2D UV((float)s / (float)Segments, tRing);
+
+                        // Primary slot — used as the LEFT edge of panel s.
+                        OutData.Vertices.Add(Pos);
+                        OutData.Normals.Add(Nrm);
+                        OutData.VertexColors.Add(Color);
+                        OutData.UV0.Add(UV);
+                        OutData.Tangents.Add(FProcMeshTangent(Tang, false));
+
+                        if (bSeam[s])
+                        {
+                                // Secondary slot — same position, but will get the
+                                // average normal of the TWO panels meeting at this seam.
+                                // We write the same smooth normal here; averaging is
+                                // implicit because both flanking panels share this vertex
+                                // only if they belong to the same face group — but since
+                                // we duplicate we assign each side its own normal below.
+                                //
+                                // Right-side normal: the panel to the LEFT of this column
+                                // (panel s-1) faces a slightly different direction.
+                                int32 sPrev = (s + Segments - 1) % Segments;
+                                float ThetaPrev = 2.f * PI * (float)sPrev / (float)Segments;
+                                FVector NrmPrev = ProfileNormal(ThetaPrev, tRing);
+                                // Use the average of the two flanking segment normals for
+                                // the secondary slot so both sides of the crease angle match.
+                                // The crease is created by the DISCONTINUITY in index, not
+                                // by diverging normal directions — any difference in normal
+                                // between primary and secondary produces the hard edge.
+                                // Here we deliberately set secondary = NrmPrev (left panel's
+                                // outward direction) so lighting breaks cleanly at the seam.
+                                OutData.Vertices.Add(Pos);
+                                OutData.Normals.Add(NrmPrev);
+                                OutData.VertexColors.Add(Color);
+                                OutData.UV0.Add(UV);
+                                OutData.Tangents.Add(FProcMeshTangent(Tang, false));
+                        }
+                }
+        }
+
+        // Apex vertex — single shared point, straight-up normal.
+        OutData.Vertices.Add(Apex);
+        OutData.Normals.Add(FVector(0, 0, 1));
+        OutData.VertexColors.Add(Color);
+        OutData.UV0.Add(FVector2D(0.5f, 1.f));
+        OutData.Tangents.Add(FProcMeshTangent(FVector(1, 0, 0), false));
+
+        // -----------------------------------------------------------------------
+        // Index helpers.
+        // RingBase(r) = VBase + r * ColsPerRing
+        // LeftIdx (r, s)  = RingBase(r) + PrimaryOff[s]   ← left  side of panel s
+        // RightIdx(r, s)  = RingBase(r) + SecondaryOff[(s+1)%Segments]
+        //                 which is the slot on the RIGHT side of panel s,
+        //                 i.e. the secondary (or primary if non-seam) of column s+1.
+        // -----------------------------------------------------------------------
+        auto RingBase = [&](int32 r) -> int32
+        {
+                return VBase + r * ColsPerRing;
+        };
+        auto LeftIdx = [&](int32 r, int32 s) -> int32
+        {
+                return RingBase(r) + PrimaryOff[s];
+        };
+        // Right side of panel s = the slot on the LEFT wall of column (s+1),
+        // seen from panel s's perspective.  If column (s+1) is a seam, the
+        // secondary slot of (s+1) is used (it carries the normal from panel s's side).
+        auto RightIdx = [&](int32 r, int32 s) -> int32
+        {
                 int32 sn = (s + 1) % Segments;
-                AddTriangle(OutData, LastRing[s], LastRing[sn], Apex, Color);
+                // Secondary slot of sn is the slot that faces panel s (the panel to its left).
+                return RingBase(r) + SecondaryOff[sn];
+        };
+
+        // Emit quad strips + apex triangles.
+        for (int32 s = 0; s < Segments; s++)
+        {
+                for (int32 r = 0; r < Rings; r++)
+                {
+                        int32 BL = LeftIdx (r,     s);
+                        int32 BR = RightIdx(r,     s);
+                        int32 TL = LeftIdx (r + 1, s);
+                        int32 TR = RightIdx(r + 1, s);
+
+                        OutData.Triangles.Add(BL);
+                        OutData.Triangles.Add(BR);
+                        OutData.Triangles.Add(TL);
+
+                        OutData.Triangles.Add(BR);
+                        OutData.Triangles.Add(TR);
+                        OutData.Triangles.Add(TL);
+                }
+
+                // Top triangle to apex.
+                OutData.Triangles.Add(LeftIdx (Rings, s));
+                OutData.Triangles.Add(RightIdx(Rings, s));
+                OutData.Triangles.Add(ApexSlot);
+        }
+}
+
+// ============================================================================
+// AddRoundRoof - Barrel vault / semi-cylindrical roof
+// Cross-section is an elliptical arch from one long edge to the other.
+// RoofDirection (0-360): orientates the barrel axis.
+// ============================================================================
+void FGeoMeshGenerator::AddRoundRoof(
+        FMeshData& OutData, const TArray<FVector>& FP,
+        float BaseZ, float RoofH, const FColor& Color,
+        float RoofDirection, const FString& RoofOrientation,
+        const FColor& WallColor)
+{
+        if (FP.Num() < 3) return;
+
+        TArray<FVector> CleanFP;
+        for (const FVector& V : FP)
+        {
+                FVector P(V.X, V.Y, BaseZ);
+                if (CleanFP.Num() > 0 && P.Equals(CleanFP.Last(), 0.5f)) continue;
+                if (CleanFP.Num() > 0 && P.Equals(CleanFP[0], 0.5f)) continue;
+                CleanFP.Add(P);
+        }
+        if (CleanFP.Num() < 3) return;
+
+        float MinX, MaxX, MinY, MaxY;
+        ComputeFootprintBounds(CleanFP, MinX, MaxX, MinY, MaxY);
+
+        // Barrel axis direction (ridge runs along AxisDir; arch spans CrossDir).
+        // The semicircular END CAPS face along ±AxisDir, so the arch is visible on
+        // the walls perpendicular to AxisDir.
+        FVector2D AxisDir;
+        if (RoofDirection >= 0.f)
+        {
+                // RoofDirection = facing direction of slope → axis = perpendicular
+                float D_rad = FMath::DegreesToRadians(RoofDirection);
+                AxisDir = FVector2D(FMath::Cos(D_rad), -FMath::Sin(D_rad));
+        }
+        else
+        {
+                // Same convention as the gabled roof: "along" (default) runs the ridge
+                // (barrel axis) along the LONG side; "across" along the SHORT side, so
+                // the arch spans the perpendicular side. BarrelAxisDir also applies the
+                // clockwise nudge so the barrel lines up with footprints rotated off the
+                // world axes. Shared with ComputeBarrelRise so the rise matches.
+                AxisDir = BarrelAxisDir(CleanFP, RoofOrientation);
+        }
+        FVector2D CrossDir(-AxisDir.Y, AxisDir.X); // perpendicular to barrel axis
+
+        // Project footprint onto axis and cross directions
+        float AxisMin = FLT_MAX, AxisMax = -FLT_MAX;
+        float CrossMin = FLT_MAX, CrossMax = -FLT_MAX;
+        for (const FVector& V : CleanFP)
+        {
+                float AP = V.X * AxisDir.X + V.Y * AxisDir.Y;
+                float CP = V.X * CrossDir.X + V.Y * CrossDir.Y;
+                AxisMin = FMath::Min(AxisMin, AP); AxisMax = FMath::Max(AxisMax, AP);
+                CrossMin = FMath::Min(CrossMin, CP); CrossMax = FMath::Max(CrossMax, CP);
+        }
+
+        float CrossCenter = (CrossMin + CrossMax) * 0.5f;
+        float Radius = (CrossMax - CrossMin) * 0.5f;
+        if (Radius < 1.f) return;
+
+        // Default RoofH to Radius (true semicircle) when none explicitly set
+        if (RoofH < Radius * 0.1f)
+                RoofH = Radius;
+
+        const int32 CrossSteps = 36; // arch subdivisions (denser = smoother arch)
+        const float StepLen = 150.f; // axis spacing in cm (more rings along the barrel)
+        int32 AxisSteps = FMath::Max(1, FMath::RoundToInt((AxisMax - AxisMin) / StepLen));
+
+        int32 GridBase = OutData.Vertices.Num();
+        int32 Cols = CrossSteps + 1;
+
+        // Build tessellated grid [AxisSteps+1][CrossSteps+1]
+        for (int32 a = 0; a <= AxisSteps; a++)
+        {
+                float AxisPos = FMath::Lerp(AxisMin, AxisMax, (float)a / (float)AxisSteps);
+
+                for (int32 c = 0; c <= CrossSteps; c++)
+                {
+                        float T = (float)c / (float)CrossSteps; // 0..1
+                        float Angle = T * PI; // 0..PI
+                        // Parametric semicircle: CrossProj moves CrossMin→CrossCenter→CrossMax
+                        float CrossProj = CrossCenter - Radius * FMath::Cos(Angle);
+                        float ZOffset = RoofH * FMath::Sin(Angle);
+
+                        float WX = AxisPos * AxisDir.X + CrossProj * CrossDir.X;
+                        float WY = AxisPos * AxisDir.Y + CrossProj * CrossDir.Y;
+                        float WZ = BaseZ + ZOffset;
+
+                        OutData.Vertices.Add(FVector(WX, WY, WZ));
+                        OutData.Normals.Add(FVector(0, 0, 1)); // recomputed later
+                        OutData.VertexColors.Add(Color);
+                        OutData.Tangents.Add(FProcMeshTangent(FVector(AxisDir.X, AxisDir.Y, 0), false));
+                        // Collapse UV to one texel: the round reads as a flat OSM colour
+                        // (no tiled texture pattern), just tinted by the vertex colour.
+                        OutData.UV0.Add(FVector2D(0.5f, 0.5f));
+                }
+        }
+
+        // Curved barrel surface quads
+        for (int32 a = 0; a < AxisSteps; a++)
+        {
+                for (int32 c = 0; c < CrossSteps; c++)
+                {
+                        int32 I00 = GridBase + a * Cols + c;
+                        int32 I01 = GridBase + a * Cols + c + 1;
+                        int32 I10 = GridBase + (a + 1) * Cols + c;
+                        int32 I11 = GridBase + (a + 1) * Cols + c + 1;
+
+                        OutData.Triangles.Add(I00); OutData.Triangles.Add(I10); OutData.Triangles.Add(I01);
+                        OutData.Triangles.Add(I01); OutData.Triangles.Add(I10); OutData.Triangles.Add(I11);
+                }
+        }
+
+        // Arched end caps (fan from bottom-center up through arch)
+        for (int32 Pass = 0; Pass < 2; Pass++)
+        {
+                int32 a = (Pass == 0) ? 0 : AxisSteps;
+                float AxisPos = (Pass == 0) ? AxisMin : AxisMax;
+                float NX = AxisDir.X * (Pass == 0 ? -1.f : 1.f);
+                float NY = AxisDir.Y * (Pass == 0 ? -1.f : 1.f);
+                FVector EndNormal(NX, NY, 0.f);
+
+                int32 CapBase = OutData.Vertices.Num();
+                for (int32 c = 0; c <= CrossSteps; c++)
+                {
+                        int32 GVIdx = GridBase + a * Cols + c;
+                        FVector CapVert = OutData.Vertices[GVIdx]; // copy before potential realloc
+                        OutData.Vertices.Add(CapVert);
+                        OutData.Normals.Add(EndNormal);
+                        // End caps are the vertical semicircular GABLE faces — paint them
+                        // with the facade colour so they read as a rounded WALL, not roof.
+                        OutData.VertexColors.Add(WallColor);
+                        OutData.Tangents.Add(FProcMeshTangent(FVector(CrossDir.X, CrossDir.Y, 0), false));
+                        OutData.UV0.Add(FVector2D(0.5f, 0.5f)); // flat colour, no texture
+                }
+                // Bottom-center closing vertex (closes the D-shape)
+                float BX = AxisPos * AxisDir.X + CrossCenter * CrossDir.X;
+                float BY = AxisPos * AxisDir.Y + CrossCenter * CrossDir.Y;
+                int32 CenterIdx = OutData.Vertices.Num();
+                OutData.Vertices.Add(FVector(BX, BY, BaseZ));
+                OutData.Normals.Add(EndNormal);
+                OutData.VertexColors.Add(WallColor);
+                OutData.Tangents.Add(FProcMeshTangent(FVector(CrossDir.X, CrossDir.Y, 0), false));
+                OutData.UV0.Add(FVector2D(0.5f, 0.5f)); // flat colour, no texture
+
+                for (int32 c = 0; c < CrossSteps; c++)
+                {
+                        if (Pass == 0)
+                        {
+                                // AxisMin cap: normal must point toward -AxisDir (outward).
+                                // Cross product of (c-Center)×(c+1-Center) gives -AxisDir. ✓
+                                OutData.Triangles.Add(CenterIdx);
+                                OutData.Triangles.Add(CapBase + c);
+                                OutData.Triangles.Add(CapBase + c + 1);
+                        }
+                        else
+                        {
+                                // AxisMax cap: normal must point toward +AxisDir (outward).
+                                OutData.Triangles.Add(CenterIdx);
+                                OutData.Triangles.Add(CapBase + c + 1);
+                                OutData.Triangles.Add(CapBase + c);
+                        }
+                }
         }
 }
 
@@ -1188,18 +1985,263 @@ static bool IsOnBoundary(const FVector2D& Point, const TArray<FVector2D>& Polygo
 // This produces correct hipped roof geometry for ANY polygon shape,
 // not just rectangles — concave, L-shaped, etc.
 // ============================================================================
+// ---------------------------------------------------------------------------
+// Local geometry helpers for the skeleton-driven hipped roof.
+// ---------------------------------------------------------------------------
+static bool PointInPolygon2D(const FVector2D& P, const TArray<FVector2D>& Poly)
+{
+        const int32 N = Poly.Num();
+        bool bIn = false;
+        for (int32 i = 0, j = N - 1; i < N; j = i++)
+        {
+                const FVector2D& A = Poly[i];
+                const FVector2D& B = Poly[j];
+                if (((A.Y > P.Y) != (B.Y > P.Y)) &&
+                        (P.X < (B.X - A.X) * (P.Y - A.Y) / (B.Y - A.Y) + A.X))
+                        bIn = !bIn;
+        }
+        return bIn;
+}
+
+// Incircle predicate: true if D lies strictly inside the circumcircle of A,B,C.
+static bool PointInCircumcircle2D(const FVector2D& A, const FVector2D& B,
+        const FVector2D& C, const FVector2D& D)
+{
+        double ax = A.X, ay = A.Y, bx = B.X, by = B.Y, cx = C.X, cy = C.Y;
+        const double Orient = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+        if (Orient < 0.0) { Swap(bx, cx); Swap(by, cy); } // force CCW
+        const double adx = ax - D.X, ady = ay - D.Y;
+        const double bdx = bx - D.X, bdy = by - D.Y;
+        const double cdx = cx - D.X, cdy = cy - D.Y;
+        const double AbD = adx * bdy - bdx * ady;
+        const double BcD = bdx * cdy - cdx * bdy;
+        const double CaD = cdx * ady - adx * cdy;
+        const double AA = adx * adx + ady * ady;
+        const double BB = bdx * bdx + bdy * bdy;
+        const double CC = cdx * cdx + cdy * cdy;
+        return (AA * BcD + BB * CaD + CC * AbD) > 0.0;
+}
+
+// Bowyer-Watson Delaunay triangulation of a 2D point set. Output: flat index
+// triples into Pts. Self-contained (no CGAL) so it runs in the Tokhdoru module.
+static void DelaunayTriangulate2D(const TArray<FVector2D>& Pts, TArray<int32>& OutTris)
+{
+        OutTris.Reset();
+        const int32 N = Pts.Num();
+        if (N < 3) return;
+
+        float MinX = Pts[0].X, MaxX = Pts[0].X, MinY = Pts[0].Y, MaxY = Pts[0].Y;
+        for (const FVector2D& P : Pts)
+        {
+                MinX = FMath::Min(MinX, P.X); MaxX = FMath::Max(MaxX, P.X);
+                MinY = FMath::Min(MinY, P.Y); MaxY = FMath::Max(MaxY, P.Y);
+        }
+        const float DMax = FMath::Max(FMath::Max(MaxX - MinX, MaxY - MinY), 1.f) * 100.f;
+        const float MidX = 0.5f * (MinX + MaxX);
+        const float MidY = 0.5f * (MinY + MaxY);
+
+        TArray<FVector2D> V = Pts; // working list; super-triangle verts appended
+        const int32 S0 = V.Add(FVector2D(MidX - 20.f * DMax, MidY - DMax));
+        const int32 S1 = V.Add(FVector2D(MidX, MidY + 20.f * DMax));
+        const int32 S2 = V.Add(FVector2D(MidX + 20.f * DMax, MidY - DMax));
+
+        struct FDTri { int32 A, B, C; };
+        TArray<FDTri> Tris;
+        Tris.Add(FDTri{ S0, S1, S2 });
+
+        for (int32 ip = 0; ip < N; ip++)
+        {
+                const FVector2D& P = V[ip];
+
+                TArray<TPair<int32, int32>> Edges;
+                auto AddEdge = [&Edges](int32 a, int32 b)
+                {
+                        for (int32 e = 0; e < Edges.Num(); e++)
+                        {
+                                if ((Edges[e].Key == a && Edges[e].Value == b) ||
+                                        (Edges[e].Key == b && Edges[e].Value == a))
+                                {
+                                        Edges.RemoveAtSwap(e); // shared edge -> interior, drop
+                                        return;
+                                }
+                        }
+                        Edges.Add(TPair<int32, int32>(a, b));
+                };
+
+                for (int32 ti = Tris.Num() - 1; ti >= 0; ti--)
+                {
+                        const FDTri& T = Tris[ti];
+                        if (PointInCircumcircle2D(V[T.A], V[T.B], V[T.C], P))
+                        {
+                                AddEdge(T.A, T.B);
+                                AddEdge(T.B, T.C);
+                                AddEdge(T.C, T.A);
+                                Tris.RemoveAtSwap(ti);
+                        }
+                }
+
+                for (const TPair<int32, int32>& E : Edges)
+                        Tris.Add(FDTri{ E.Key, E.Value, ip });
+        }
+
+        for (const FDTri& T : Tris)
+        {
+                if (T.A >= N || T.B >= N || T.C >= N) continue; // drop super-triangle fans
+                OutTris.Add(T.A); OutTris.Add(T.B); OutTris.Add(T.C);
+        }
+}
+
+// ============================================================================
+// AddStraightSkeletonRoof
+// Build the roof directly from the straight-skeleton FACES. CGAL gives one
+// face per footprint edge: the sloped panel rising from that edge up to the
+// ridge. We lift each face vertex by its skeleton time (constant pitch,
+// normalised so the deepest ridge point reaches RidgeHeight) and triangulate
+// each face. Because the faces tile the footprint exactly, the result is
+// watertight with NO missing triangles and NO sideways slivers — for any
+// polygon shape (rectangle, L, U, cross, with courtyards).
+// ============================================================================
+bool FGeoMeshGenerator::AddStraightSkeletonRoof(
+        FMeshData& OutRoofData,
+        const TArray<FVector>& Footprint,
+        float BaseZ,
+        float RidgeHeight,
+        const FColor& Color,
+        const TArray<TArray<FVector2D>>& Holes)
+{
+        if (Footprint.Num() < 3) return false;
+
+        try
+        {
+        // Clean footprint (CCW)
+        TArray<FVector> CleanFP;
+        for (const FVector& V : Footprint)
+        {
+                FVector P(V.X, V.Y, BaseZ);
+                if (CleanFP.Num() > 0 && P.Equals(CleanFP.Last(), 0.5f)) continue;
+                if (CleanFP.Num() > 0 && P.Equals(CleanFP[0], 0.5f)) continue;
+                CleanFP.Add(P);
+        }
+        if (CleanFP.Num() < 3) return false;
+        if (ComputeSignedArea2D(CleanFP) < 0.f) Algo::Reverse(CleanFP);
+
+        TArray<FVector2D> Poly2D;
+        for (const FVector& V : CleanFP) Poly2D.Add(FVector2D(V.X, V.Y));
+
+        FCGALSkeletonResult Skel = FCGALSkeletonGenerator::GenerateSkeleton(Poly2D, Holes);
+        if (!Skel.IsValid() || Skel.Faces.Num() == 0) return false;
+
+        const float MaxT = FMath::Max(Skel.MaxTime, 1.f);
+        auto ZForTime = [&](float T) -> float
+        {
+                return BaseZ + RidgeHeight * FMath::Clamp(T / MaxT, 0.f, 1.f);
+        };
+
+        // Boundary (eave) positions of the footprint, used to force any
+        // skeleton vertex that lies ON the building outline to sit exactly
+        // at BaseZ. Without this, tiny CGAL Time>0 values on outline
+        // vertices (especially at corners) cause the roof edges/corners to
+        // "curl up" like bird wings instead of resting flat on the walls.
+        TArray<FVector2D> BoundaryPts2D;
+        for (const FVector& V : CleanFP) BoundaryPts2D.Add(FVector2D(V.X, V.Y));
+
+        auto IsOnBoundary = [&](const FVector2D& P) -> bool
+        {
+                const int32 N = BoundaryPts2D.Num();
+                for (int32 i = 0; i < N; i++)
+                {
+                        const FVector2D& A = BoundaryPts2D[i];
+                        const FVector2D& B = BoundaryPts2D[(i + 1) % N];
+                        const FVector2D AB = B - A;
+                        const float LenSq = AB.SizeSquared();
+                        if (LenSq < KINDA_SMALL_NUMBER)
+                        {
+                                if (FVector2D::DistSquared(P, A) < 1.f) return true;
+                                continue;
+                        }
+                        const float T = FVector2D::DotProduct(P - A, AB) / LenSq;
+                        const float Tc = FMath::Clamp(T, 0.f, 1.f);
+                        const FVector2D Closest = A + AB * Tc;
+                        if (FVector2D::DistSquared(P, Closest) < 1.f) return true;
+                }
+                return false;
+        };
+
+        int32 Emitted = 0;
+        for (const FCGALSkeletonFace& Face : Skel.Faces)
+        {
+                const int32 NF = Face.VertexIndices.Num();
+                if (NF < 3) continue;
+
+                // Collect the face boundary (2D + per-vertex roof height).
+                TArray<FVector2D> FP2D;
+                TArray<float> FZ;
+                FP2D.Reserve(NF); FZ.Reserve(NF);
+                for (int32 Idx : Face.VertexIndices)
+                {
+                        if (Idx < 0 || Idx >= Skel.Vertices.Num()) continue;
+                        const FCGALSkeletonVertex& SV = Skel.Vertices[Idx];
+                        // Drop consecutive duplicates that would break ear-clipping.
+                        if (FP2D.Num() > 0 && FVector2D::DistSquared(FP2D.Last(), SV.Position) < 1.f) continue;
+                        FP2D.Add(SV.Position);
+                        FZ.Add(IsOnBoundary(SV.Position) ? BaseZ : ZForTime(SV.Time));
+                }
+                if (FP2D.Num() > 1 && FVector2D::DistSquared(FP2D[0], FP2D.Last()) < 1.f)
+                {
+                        FP2D.Pop(); FZ.Pop();
+                }
+                if (FP2D.Num() < 3) continue;
+
+                // Triangulate the face. Ear-clipping handles the (usually convex,
+                // occasionally reflex) skeleton panels; fan is the safety net.
+                TArray<int32> Tris;
+                TriangulatePolygon2D(FP2D, Tris);
+                if (Tris.Num() < 3)
+                {
+                        Tris.Reset();
+                        for (int32 k = 1; k + 1 < FP2D.Num(); k++)
+                        {
+                                Tris.Add(0); Tris.Add(k); Tris.Add(k + 1);
+                        }
+                }
+
+                for (int32 t = 0; t + 2 < Tris.Num(); t += 3)
+                {
+                        const int32 a = Tris[t], b = Tris[t + 1], c = Tris[t + 2];
+                        if (a == b || b == c || a == c) continue;
+                        FVector V0(FP2D[a].X, FP2D[a].Y, FZ[a]);
+                        FVector V1(FP2D[b].X, FP2D[b].Y, FZ[b]);
+                        FVector V2(FP2D[c].X, FP2D[c].Y, FZ[c]);
+                        // Force the panel to face upward (consistent lighting).
+                        if (FVector::CrossProduct(V1 - V0, V2 - V0).Z < 0.f)
+                                Swap(V1, V2);
+                        AddTriangle(OutRoofData, V0, V1, V2, Color);
+                        Emitted++;
+                }
+        }
+
+        return Emitted > 0;
+        }
+        catch (...)
+        {
+                UE_LOG(LogTemp, Warning, TEXT("AddStraightSkeletonRoof: exception, caller will fall back"));
+                return false;
+        }
+}
+
 void FGeoMeshGenerator::AddSkeletonHippedRoof(
         FMeshData& OutRoofData,
         const TArray<FVector>& Footprint,
         float BaseZ,
         float RidgeHeight,
-        const FColor& Color)
+        const FColor& Color,
+        const TArray<TArray<FVector2D>>& Holes)
 {
         if (Footprint.Num() < 3) return;
 
         try
         {
-        // Clean footprint
+        // Clean footprint (CCW)
         TArray<FVector> CleanFP;
         for (const FVector& V : Footprint)
         {
@@ -1211,76 +2253,279 @@ void FGeoMeshGenerator::AddSkeletonHippedRoof(
         if (CleanFP.Num() < 3) return;
         if (ComputeSignedArea2D(CleanFP) < 0.f) Algo::Reverse(CleanFP);
 
-        // Convert to 2D
-        TArray<FVector2D> Poly2D;
-        for (const FVector& V : CleanFP)
-                Poly2D.Add(FVector2D(V.X, V.Y));
-
-        // Generate straight skeleton
-        FCGALSkeletonResult Skeleton = FCGALSkeletonGenerator::GenerateSkeleton(Poly2D);
-        if (!Skeleton.IsValid() || Skeleton.MaxTime < 0.01f)
+        // ------------------------------------------------------------------
+        // HOLES branch: keep the CGAL CDT cap (flat surface that excludes the
+        // inner courtyards). Courtyard buildings are rare; a flat-but-correct
+        // hole exclusion is acceptable here.
+        // ------------------------------------------------------------------
+        if (Holes.Num() > 0)
         {
-                UE_LOG(LogTemp, Warning, TEXT("CGAL Skeleton failed for hipped roof, falling back to AABB"));
-                AddHippedRoof(OutRoofData, Footprint, BaseZ, RidgeHeight, Color);
+                TArray<FVector2D> Poly2D;
+                for (const FVector& V : CleanFP) Poly2D.Add(FVector2D(V.X, V.Y));
+
+                TArray<int32> Triangles;
+                TArray<FVector2D> SteinerPoints;
+                // First try a genuinely SLOPED roof from the straight skeleton WITH holes:
+                // interior skeleton nodes carry Time (height); triangulate them and keep
+                // triangles inside the outer ring AND outside every courtyard.
+                {
+                        FCGALSkeletonResult HoleSkel = FCGALSkeletonGenerator::GenerateSkeleton(Poly2D, Holes);
+                        if (HoleSkel.IsValid() && HoleSkel.Vertices.Num() >= 3)
+                        {
+                                float hMinX = Poly2D[0].X, hMaxX = Poly2D[0].X, hMinY = Poly2D[0].Y, hMaxY = Poly2D[0].Y;
+                                for (const FVector2D& P : Poly2D)
+                                {
+                                        hMinX = FMath::Min(hMinX, P.X); hMaxX = FMath::Max(hMaxX, P.X);
+                                        hMinY = FMath::Min(hMinY, P.Y); hMaxY = FMath::Max(hMaxY, P.Y);
+                                }
+                                const float RidgeRun = FMath::Max(0.5f * FMath::Min(hMaxX - hMinX, hMaxY - hMinY), 1.f);
+                                TArray<FVector2D> HPts; TArray<float> HZs;
+                                for (const FCGALSkeletonVertex& SV : HoleSkel.Vertices)
+                                {
+                                        bool bDup = false;
+                                        for (const FVector2D& Q : HPts)
+                                                if (FVector2D::DistSquared(Q, SV.Position) < 1.f) { bDup = true; break; }
+                                        if (bDup) continue;
+                                        HPts.Add(SV.Position);
+                                        HZs.Add(BaseZ + RidgeHeight * FMath::Min(1.f, SV.Time / RidgeRun));
+                                }
+                                TArray<int32> HTris;
+                                DelaunayTriangulate2D(HPts, HTris);
+                                int32 HEmitted = 0;
+                                for (int32 t = 0; t + 2 < HTris.Num(); t += 3)
+                                {
+                                        const int32 i0 = HTris[t], i1 = HTris[t + 1], i2 = HTris[t + 2];
+                                        const FVector2D& P0 = HPts[i0];
+                                        const FVector2D& P1 = HPts[i1];
+                                        const FVector2D& P2 = HPts[i2];
+                                        const FVector2D Cen = (P0 + P1 + P2) / 3.f;
+                                        // Reject triangles that bridge the outer concavity or a courtyard. Test
+                                        // the centroid AND each edge midpoint (nudged 2% inward) so spanning
+                                        // slivers are dropped while legitimate boundary triangles survive.
+                                        auto SampleOK = [&](const FVector2D& Q) -> bool
+                                        {
+                                                if (!PointInPolygon2D(Q, Poly2D)) return false;
+                                                for (const TArray<FVector2D>& H : Holes)
+                                                        if (PointInPolygon2D(Q, H)) return false;
+                                                return true;
+                                        };
+                                        auto EdgeMidOK = [&](const FVector2D& A, const FVector2D& B) -> bool
+                                        {
+                                                FVector2D M = (A + B) * 0.5f;
+                                                M += (Cen - M) * 0.02f;
+                                                return SampleOK(M);
+                                        };
+                                        if (!SampleOK(Cen)) continue;
+                                        if (!EdgeMidOK(P0, P1) || !EdgeMidOK(P1, P2) || !EdgeMidOK(P2, P0)) continue;
+                                        AddTriangle(OutRoofData,
+                                                FVector(HPts[i0].X, HPts[i0].Y, HZs[i0]),
+                                                FVector(HPts[i1].X, HPts[i1].Y, HZs[i1]),
+                                                FVector(HPts[i2].X, HPts[i2].Y, HZs[i2]), Color);
+                                        HEmitted++;
+                                }
+                                if (HEmitted > 0) return;
+                        }
+                }
+
+                // Fallback: flat CDT cap that excludes the courtyards (rare).
+                FCGALSkeletonGenerator::TriangulateWithCGAL(Poly2D, Holes, Triangles, SteinerPoints);
+                if (Triangles.Num() < 3) { AddPolygonTriangulated(OutRoofData, Footprint, BaseZ, Color); return; }
+
+                TArray<FVector2D> AllPoints; AllPoints.Append(Poly2D); AllPoints.Append(SteinerPoints);
+                int32 BaseIdx = OutRoofData.Vertices.Num();
+                for (const FVector2D& Pt : AllPoints)
+                {
+                        OutRoofData.Vertices.Add(FVector(Pt.X, Pt.Y, BaseZ));
+                        OutRoofData.Normals.Add(FVector(0.f, 0.f, 1.f));
+                        OutRoofData.VertexColors.Add(Color);
+                        OutRoofData.Tangents.Add(FProcMeshTangent(FVector(1, 0, 0), false));
+                        OutRoofData.UV0.Add(FVector2D(Pt.X / 100.f, Pt.Y / 100.f));
+                }
+                for (int32 TriIdx : Triangles) OutRoofData.Triangles.Add(BaseIdx + TriIdx);
                 return;
         }
 
-        // Triangulate using CGAL CDT (more robust than ear-clipping)
-        TArray<int32> Triangles;
-        TArray<FVector2D> SteinerPoints;
-        FCGALSkeletonGenerator::TriangulateWithCGAL(Poly2D, Triangles, SteinerPoints);
-
-        if (Triangles.Num() < 3)
+        // ------------------------------------------------------------------
+        // SOLID footprint: build a genuinely SLOPED hipped roof from concentric
+        // inset rings raised toward the spine. This is robust for ANY polygon
+        // (rect, L, U, ...) and — unlike a bare CDT — actually produces interior
+        // raised geometry, so the roof is visibly pitched (the previous CDT path
+        // left every vertex on the boundary at BaseZ, i.e. a flat roof).
+        // ------------------------------------------------------------------
+        float MinX, MaxX, MinY, MaxY;
+        ComputeFootprintBounds(CleanFP, MinX, MaxX, MinY, MaxY);
+        const float HalfShort = 0.5f * FMath::Min(MaxX - MinX, MaxY - MinY);
+        if (HalfShort < 1.f || RidgeHeight < 1.f)
         {
-                UE_LOG(LogTemp, Warning, TEXT("CGAL CDT failed for hipped roof, falling back to AABB"));
-                AddHippedRoof(OutRoofData, Footprint, BaseZ, RidgeHeight, Color);
+                AddPolygonTriangulated(OutRoofData, CleanFP, BaseZ, Color);
                 return;
         }
 
-        // Combine original + Steiner points
-        TArray<FVector2D> AllPoints;
-        AllPoints.Append(Poly2D);
-        AllPoints.Append(SteinerPoints);
+        const int32 NumRings = 6; (void)NumRings;
 
-        // Build mesh vertices with skeleton-computed heights
-        int32 BaseIdx = OutRoofData.Vertices.Num();
+                // ------------------------------------------------------------------
+                // Skeleton-driven hipped/pyramidal roof.
+                // Each straight-skeleton node carries Time = distance from the eave;
+                // lift it to BaseZ + RidgeHeight*(Time/MaxTime). A Delaunay triangulation
+                // of all skeleton nodes (boundary Time=0 + interior ridge nodes), filtered
+                // to triangles whose centroid is inside the footprint, gives a true sloped
+                // roof for ANY polygon (rect, L, U, concave) with no polygon offsetting.
+                // ------------------------------------------------------------------
+                {
+                        TArray<FVector2D> Poly2D;
+                        for (const FVector& V : CleanFP) Poly2D.Add(FVector2D(V.X, V.Y));
 
-        for (int32 i = 0; i < AllPoints.Num(); i++)
+                        FCGALSkeletonResult Skel = FCGALSkeletonGenerator::GenerateSkeleton(Poly2D);
+                        if (Skel.IsValid() && Skel.Vertices.Num() >= 3)
+                        {
+                                // CONSTANT-PITCH height: rise uniformly from every eave and flatten
+                                // into a level ridge once the roof reaches RidgeHeight. Using the
+                                // short-side half-width as the horizontal run keeps the slope even,
+                                // which avoids the jagged multi-peak look that Time/MaxTime produced.
+                                const float RidgeRun = FMath::Max(HalfShort, 1.f);
+                                TArray<FVector2D> Pts; TArray<float> Zs;
+                                Pts.Reserve(Skel.Vertices.Num()); Zs.Reserve(Skel.Vertices.Num());
+
+                                // Snap any skeleton vertex lying on the footprint outline to
+                                // BaseZ exactly. CGAL's exact-kernel Time for outline points
+                                // (especially corners) is often a tiny epsilon > 0 instead
+                                // of 0, which otherwise lifts that single point and produces
+                                // a sharp "bird wing" flap at the corner.
+                                auto IsOnOutline = [&](const FVector2D& P) -> bool
+                                {
+                                        const int32 N = Poly2D.Num();
+                                        for (int32 i = 0; i < N; i++)
+                                        {
+                                                const FVector2D& A = Poly2D[i];
+                                                const FVector2D& B = Poly2D[(i + 1) % N];
+                                                const FVector2D AB = B - A;
+                                                const float LenSq = AB.SizeSquared();
+                                                if (LenSq < KINDA_SMALL_NUMBER)
+                                                {
+                                                        if (FVector2D::DistSquared(P, A) < 1.f) return true;
+                                                        continue;
+                                                }
+                                                const float T = FVector2D::DotProduct(P - A, AB) / LenSq;
+                                                const float Tc = FMath::Clamp(T, 0.f, 1.f);
+                                                const FVector2D Closest = A + AB * Tc;
+                                                if (FVector2D::DistSquared(P, Closest) < 1.f) return true;
+                                        }
+                                        return false;
+                                };
+
+                                for (const FCGALSkeletonVertex& SV : Skel.Vertices)
+                                {
+                                        bool bDup = false;
+                                        for (const FVector2D& Q : Pts)
+                                                if (FVector2D::DistSquared(Q, SV.Position) < 1.f) { bDup = true; break; }
+                                        if (bDup) continue;
+                                        Pts.Add(SV.Position);
+                                        Zs.Add(IsOnOutline(SV.Position) ? BaseZ : BaseZ + RidgeHeight * FMath::Min(1.f, SV.Time / RidgeRun));
+                                }
+
+                                TArray<int32> Tris;
+                                DelaunayTriangulate2D(Pts, Tris);
+
+                                int32 Emitted = 0;
+                                for (int32 t = 0; t + 2 < Tris.Num(); t += 3)
+                                {
+                                        const int32 i0 = Tris[t], i1 = Tris[t + 1], i2 = Tris[t + 2];
+                                        const FVector2D& P0 = Pts[i0];
+                                        const FVector2D& P1 = Pts[i1];
+                                        const FVector2D& P2 = Pts[i2];
+                                        const FVector2D Cen = (P0 + P1 + P2) / 3.f;
+                                        // Reject triangles that bridge a concave notch. Centroid-only is not
+                                        // enough: a thin spanning sliver can have its centroid just inside the
+                                        // footprint, producing the diagonal flap / needle-spike artefacts. Also
+                                        // require each EDGE midpoint (nudged 2% toward the centroid so legitimate
+                                        // boundary edges, whose midpoints lie ON the outline, still pass) inside.
+                                        auto EdgeMidInside = [&](const FVector2D& A, const FVector2D& B) -> bool
+                                        {
+                                                FVector2D M = (A + B) * 0.5f;
+                                                M += (Cen - M) * 0.02f;
+                                                return PointInPolygon2D(M, Poly2D);
+                                        };
+                                        if (!PointInPolygon2D(Cen, Poly2D)) continue; // skip concavity spans
+                                        if (!EdgeMidInside(P0, P1) || !EdgeMidInside(P1, P2) || !EdgeMidInside(P2, P0)) continue;
+                                        AddTriangle(OutRoofData,
+                                                FVector(P0.X, P0.Y, Zs[i0]),
+                                                FVector(P1.X, P1.Y, Zs[i1]),
+                                                FVector(P2.X, P2.Y, Zs[i2]), Color);
+                                        Emitted++;
+                                }
+                                if (Emitted > 0) return;
+                        }
+
+                        // Skeleton unavailable/degenerate -> pyramidal CGAL fallback.
+                        AddPyramidalRoof(OutRoofData, Footprint, BaseZ, RidgeHeight, Color);
+                        return;
+                }
+        #if 0 // legacy inset-ring hip path, superseded by skeleton triangulation
+                const float MaxInset = HalfShort * 0.92f; // nearly collapse to the spine
+
+        TArray<FVector> PrevRing = CleanFP;       // outer ring at eave height
+        for (FVector& V : PrevRing) V.Z = BaseZ;
+
+        for (int32 k = 1; k <= NumRings; k++)
         {
-                const FVector2D& Pt = AllPoints[i];
+                const float T = (float)k / (float)NumRings;
+                const float Z = BaseZ + RidgeHeight * T;
+                TArray<FVector> Ring = InsetPolygonByEdgeOffset(CleanFP, T * MaxInset);
+                for (FVector& V : Ring) V.Z = Z;
 
-                // Boundary vertices get BaseZ, interior get skeleton height
-                float VertexZ;
-                if (i < Poly2D.Num())
+                // If the inset ring collapsed or changed vertex count (happens on
+                // complex/concave footprints), bridge with a centroid fan instead
+                // of mismatched quads that produce twisted "taco" artefacts.
+                if (Ring.Num() < 3)
                 {
-                        // This is an original boundary vertex
-                        VertexZ = BaseZ;
-                }
-                else
-                {
-                        // Steiner point — compute height from skeleton
-                        VertexZ = ComputeSkeletonHeight(Pt, Skeleton, BaseZ, RidgeHeight);
+                        FVector Apex = ComputePolygonCentroid(PrevRing);
+                        Apex.Z = BaseZ + RidgeHeight;
+                        const int32 PN = PrevRing.Num();
+                        for (int32 i = 0; i < PN; i++)
+                        {
+                                const int32 ni = (i + 1) % PN;
+                                if (FVector2D::Distance(FVector2D(PrevRing[i].X, PrevRing[i].Y),
+                                        FVector2D(PrevRing[ni].X, PrevRing[ni].Y)) < 1.f) continue;
+                                AddTriangle(OutRoofData, PrevRing[i], PrevRing[ni], Apex, Color);
+                        }
+                        PrevRing.Empty();
+                        break;
                 }
 
-                OutRoofData.Vertices.Add(FVector(Pt.X, Pt.Y, VertexZ));
-                OutRoofData.Normals.Add(FVector(0.f, 0.f, 1.f));
-                OutRoofData.VertexColors.Add(Color);
-                OutRoofData.Tangents.Add(FProcMeshTangent(FVector(1, 0, 0), false));
-                OutRoofData.UV0.Add(FVector2D(Pt.X / 100.f, Pt.Y / 100.f));
+                if (PrevRing.Num() != Ring.Num())
+                {
+                        // Vertex count changed — fan from centroid to avoid cross-ring twisting
+                        FVector MidCen = ComputePolygonCentroid(PrevRing);
+                        MidCen.Z = Z;
+                        const int32 PN = PrevRing.Num();
+                        for (int32 i = 0; i < PN; i++)
+                        {
+                                const int32 ni = (i + 1) % PN;
+                                AddTriangle(OutRoofData, PrevRing[i], PrevRing[ni], MidCen, Color);
+                        }
+                        PrevRing = MoveTemp(Ring);
+                        continue;
+                }
+
+                const int32 N = PrevRing.Num();
+                for (int32 i = 0; i < N; i++)
+                {
+                        const int32 ni = (i + 1) % N;
+                        // Sloped band quad: outer-lower edge up to inner-higher edge.
+                        AddQuad(OutRoofData, PrevRing[i], PrevRing[ni], Ring[ni], Ring[i], Color);
+                }
+                PrevRing = MoveTemp(Ring);
         }
 
-        // Add triangles
-        for (int32 TriIdx : Triangles)
-                OutRoofData.Triangles.Add(BaseIdx + TriIdx);
-
-        UE_LOG(LogTemp, Verbose,
-                TEXT("CGAL Skeleton Hipped Roof: %d verts, %d tris, maxTime=%.1f"),
-                AllPoints.Num(), Triangles.Num() / 3, Skeleton.MaxTime);
+        // Close the (small) top ring with a flat cap at ridge height.
+        if (PrevRing.Num() >= 3)
+                AddPolygonTriangulated(OutRoofData, PrevRing, PrevRing[0].Z, Color, true);
+#endif
         }
         catch (...)
         {
-                UE_LOG(LogTemp, Warning, TEXT("CGAL Skeleton Hipped Roof: Exception caught, falling back to AABB"));
-                AddHippedRoof(OutRoofData, Footprint, BaseZ, RidgeHeight, Color);
+                UE_LOG(LogTemp, Warning, TEXT("CGAL Skeleton Hipped Roof: Exception caught, using flat fallback"));
+                AddPolygonTriangulated(OutRoofData, Footprint, BaseZ, Color);
         }
 }
 
@@ -1303,9 +2548,52 @@ void FGeoMeshGenerator::AddSkeletonGabledRoof(
         const TArray<FVector>& Footprint,
         float BaseZ,
         float RidgeHeight,
-        const FColor& Color)
+        const FColor& Color,
+        const TArray<TArray<FVector2D>>& Holes,
+        float RoofDirection,
+        const FString& RoofOrientation)
 {
         if (Footprint.Num() < 3) return;
+
+        // A gabled roof around an inner courtyard is not well-defined by the
+        // single-ridge split; the straight-skeleton (hipped) roof handles a
+        // polygon-with-holes correctly, so defer to it when holes are present.
+        if (Holes.Num() > 0)
+        {
+                AddSkeletonHippedRoof(OutRoofData, Footprint, BaseZ, RidgeHeight, Color, Holes);
+                return;
+        }
+
+        // The single-ridge split only behaves on SIMPLE CONVEX footprints
+        // (rectangular houses). For concave / complex footprints (L-shapes, a
+        // basilica nave, ...) it produces broken geometry, so use the robust
+        // straight-skeleton roof, which handles any polygon shape cleanly.
+        {
+                auto IsConvexXY = [](const TArray<FVector>& P) -> bool
+                {
+                        const int32 N = P.Num();
+                        if (N < 4) return true;
+                        int32 Sign = 0;
+                        for (int32 i = 0; i < N; i++)
+                        {
+                                const FVector& A = P[i];
+                                const FVector& B = P[(i + 1) % N];
+                                const FVector& C = P[(i + 2) % N];
+                                const float Cross = (B.X - A.X) * (C.Y - B.Y) - (B.Y - A.Y) * (C.X - B.X);
+                                if (FMath::Abs(Cross) < 1.f) continue;
+                                const int32 S = (Cross > 0.f) ? 1 : -1;
+                                if (Sign == 0) Sign = S;
+                                else if (S != Sign) return false;
+                        }
+                        return true;
+                };
+
+                if (!IsConvexXY(Footprint))
+                {
+                        AddSkeletonHippedRoof(OutRoofData, Footprint, BaseZ, RidgeHeight, Color);
+                        return;
+                }
+        }
 
         try
         {
@@ -1326,49 +2614,72 @@ void FGeoMeshGenerator::AddSkeletonGabledRoof(
         for (const FVector& V : CleanFP)
                 Poly2D.Add(FVector2D(V.X, V.Y));
 
-        // Try to find ridge line from skeleton
-        FCGALSkeletonResult Skeleton = FCGALSkeletonGenerator::GenerateSkeleton(Poly2D);
-
-        // Find the longest bisector edge — that's the ridge line
+        // Find the ridge line: explicit direction > skeleton detection > AABB fallback
         FVector2D RidgeA(0.f, 0.f), RidgeB(0.f, 0.f);
         float RidgeLen = 0.f;
         bool bFoundRidge = false;
 
-        if (Skeleton.IsValid())
+        if (RoofDirection >= 0.f)
         {
-                for (const FCGALSkeletonEdge& Edge : Skeleton.Edges)
+                // roof:direction is the bearing the slope faces → ridge runs perpendicular
+                // RidgeDir = (cos(D), -sin(D)) in X-East / Y-North coord system
+                float D_rad = FMath::DegreesToRadians(RoofDirection);
+                FVector2D DirectRidgeDir(FMath::Cos(D_rad), -FMath::Sin(D_rad));
+
+                float MinX, MaxX, MinY, MaxY;
+                ComputeFootprintBounds(CleanFP, MinX, MaxX, MinY, MaxY);
+                float CX = (MinX + MaxX) * 0.5f, CY = (MinY + MaxY) * 0.5f;
+                float Extent = FMath::Max(MaxX - MinX, MaxY - MinY) * 1.2f;
+
+                RidgeA = FVector2D(CX, CY) - DirectRidgeDir * Extent;
+                RidgeB = FVector2D(CX, CY) + DirectRidgeDir * Extent;
+                RidgeLen = FVector2D::Distance(RidgeA, RidgeB);
+                bFoundRidge = true;
+        }
+        else
+        {
+                // Try to find ridge line from CGAL straight skeleton
+                FCGALSkeletonResult Skeleton = FCGALSkeletonGenerator::GenerateSkeleton(Poly2D);
+
+                if (Skeleton.IsValid())
                 {
-                        if (!Edge.bIsBisector) continue;
-                        if (Edge.VertexA < 0 || Edge.VertexA >= Skeleton.Vertices.Num()) continue;
-                        if (Edge.VertexB < 0 || Edge.VertexB >= Skeleton.Vertices.Num()) continue;
-
-                        const FCGALSkeletonVertex& VA = Skeleton.Vertices[Edge.VertexA];
-                        const FCGALSkeletonVertex& VB = Skeleton.Vertices[Edge.VertexB];
-
-                        // Only consider edges between two interior vertices (both have time > 0)
-                        // This is the ridge line
-                        if (VA.Time > 0.01f && VB.Time > 0.01f)
+                        for (const FCGALSkeletonEdge& Edge : Skeleton.Edges)
                         {
-                                float Len = FVector2D::Distance(VA.Position, VB.Position);
-                                if (Len > RidgeLen)
+                                if (!Edge.bIsBisector) continue;
+                                if (Edge.VertexA < 0 || Edge.VertexA >= Skeleton.Vertices.Num()) continue;
+                                if (Edge.VertexB < 0 || Edge.VertexB >= Skeleton.Vertices.Num()) continue;
+
+                                const FCGALSkeletonVertex& VA = Skeleton.Vertices[Edge.VertexA];
+                                const FCGALSkeletonVertex& VB = Skeleton.Vertices[Edge.VertexB];
+
+                                // Only interior-to-interior edges form the ridge
+                                if (VA.Time > 0.01f && VB.Time > 0.01f)
                                 {
-                                        RidgeLen = Len;
-                                        RidgeA = VA.Position;
-                                        RidgeB = VB.Position;
-                                        bFoundRidge = true;
+                                        float Len = FVector2D::Distance(VA.Position, VB.Position);
+                                        if (Len > RidgeLen)
+                                        {
+                                                RidgeLen = Len;
+                                                RidgeA = VA.Position;
+                                                RidgeB = VB.Position;
+                                                bFoundRidge = true;
+                                        }
                                 }
                         }
                 }
         }
 
-        // If we couldn't find a ridge from the skeleton, use AABB fallback
+        // AABB fallback (also handles roof:orientation "along"/"across")
         if (!bFoundRidge)
         {
                 float MinX, MaxX, MinY, MaxY;
                 ComputeFootprintBounds(CleanFP, MinX, MaxX, MinY, MaxY);
                 float CX = (MinX + MaxX) * 0.5f, CY = (MinY + MaxY) * 0.5f;
 
-                if (IsLongerAlongX(CleanFP))
+                bool bLongX = IsLongerAlongX(CleanFP);
+                // "across": ridge perpendicular to long axis; "along" (default): along long axis
+                bool bAcross = (RoofOrientation.ToLower() == TEXT("across"));
+
+                if (bLongX != bAcross)
                 {
                         RidgeA = FVector2D(MinX, CY);
                         RidgeB = FVector2D(MaxX, CY);
@@ -1399,19 +2710,46 @@ void FGeoMeshGenerator::AddSkeletonGabledRoof(
 
         if (!bSplitOK || SubPolygons.Num() < 2)
         {
-                // Fallback: use CGAL CDT on the whole polygon with ridge-based heights
+                // Fallback: Insert the two ridge-boundary intersection points (where the ridge
+                // LINE meets the footprint boundary) into Poly2D so CGAL CDT produces vertices
+                // at the gable apexes. Without them, every footprint vertex is at MaxDist from
+                // the ridge → NormalizedDist=1 → Z=BaseZ for all → flat roof instead of gabled.
+                TArray<FVector2D> AugPoly = Poly2D;
+                {
+                        // Find the (at most 2) edges that straddle the ridge line and compute
+                        // their intersection points, inserting them in reverse-index order so
+                        // earlier indices stay valid.
+                        struct FRidgePt { FVector2D Pt; int32 AfterIdx; };
+                        TArray<FRidgePt> RidgePts;
+                        for (int32 i = 0; i < Poly2D.Num(); i++)
+                        {
+                                int32 Next = (i + 1) % Poly2D.Num();
+                                float DA = SignedDistanceToLine(Poly2D[i], RidgeA, RidgeB);
+                                float DB = SignedDistanceToLine(Poly2D[Next], RidgeA, RidgeB);
+                                if (DA * DB < 0.f)
+                                {
+                                        float T = DA / (DA - DB);
+                                        FVector2D P = Poly2D[i] + T * (Poly2D[Next] - Poly2D[i]);
+                                        RidgePts.Add({ P, i });
+                                }
+                        }
+                        RidgePts.Sort([](const FRidgePt& A, const FRidgePt& B) { return A.AfterIdx > B.AfterIdx; });
+                        for (const FRidgePt& RP : RidgePts)
+                                AugPoly.Insert(RP.Pt, RP.AfterIdx + 1);
+                }
+
                 TArray<int32> Triangles;
                 TArray<FVector2D> SteinerPoints;
-                FCGALSkeletonGenerator::TriangulateWithCGAL(Poly2D, Triangles, SteinerPoints);
+                FCGALSkeletonGenerator::TriangulateWithCGAL(AugPoly, Triangles, SteinerPoints);
 
                 if (Triangles.Num() < 3)
                 {
-                        AddGabledRoof(OutRoofData, Footprint, BaseZ, RidgeHeight, Color);
+                        AddSkeletonHippedRoof(OutRoofData, Footprint, BaseZ, RidgeHeight, Color);
                         return;
                 }
 
                 TArray<FVector2D> AllPoints;
-                AllPoints.Append(Poly2D);
+                AllPoints.Append(AugPoly);
                 AllPoints.Append(SteinerPoints);
 
                 int32 BaseIdx = OutRoofData.Vertices.Num();
@@ -1433,7 +2771,7 @@ void FGeoMeshGenerator::AddSkeletonGabledRoof(
                 for (int32 TriIdx : Triangles)
                         OutRoofData.Triangles.Add(BaseIdx + TriIdx);
 
-                // Add gable walls: vertical triangles at the ridge ends
+                // Gable walls: edges that straddle the ridge get a vertical triangle.
                 for (int32 i = 0; i < CleanFP.Num(); i++)
                 {
                         int32 Next = (i + 1) % CleanFP.Num();
@@ -1443,17 +2781,20 @@ void FGeoMeshGenerator::AddSkeletonGabledRoof(
                         float DistA = SignedDistanceToLine(FVector2D(A.X, A.Y), RidgeA, RidgeB);
                         float DistB = SignedDistanceToLine(FVector2D(B.X, B.Y), RidgeA, RidgeB);
 
-                        // If one vertex is on one side and the other is very close to the ridge,
-                        // or both are close to the ridge but on opposite sides,
-                        // we need a gable wall
-                        if (FMath::Abs(DistA) < MaxDist * 0.05f || FMath::Abs(DistB) < MaxDist * 0.05f)
+                        if (DistA * DistB < 0.f)
                         {
-                                if (FMath::Abs(DistA) < MaxDist * 0.05f && FMath::Abs(DistB) < MaxDist * 0.05f)
+                                float EdgeDX = B.X - A.X, EdgeDY = B.Y - A.Y;
+                                float Den = RidgeDir.X * EdgeDY - RidgeDir.Y * EdgeDX;
+                                if (FMath::Abs(Den) > 0.0001f)
                                 {
-                                        // Both on ridge — add gable wall
-                                        FVector ATop(A.X, A.Y, BaseZ + RidgeHeight);
-                                        FVector BTop(B.X, B.Y, BaseZ + RidgeHeight);
-                                        AddQuad(OutRoofData, A, B, BTop, ATop, Color);
+                                        float NumS = RidgeDir.X * (A.Y - RidgeA.Y) - RidgeDir.Y * (A.X - RidgeA.X);
+                                        float S = NumS / Den;
+                                        FVector2D Apex2D(A.X + S * EdgeDX, A.Y + S * EdgeDY);
+                                        AddTriangle(OutRoofData,
+                                                FVector(A.X, A.Y, BaseZ),
+                                                FVector(B.X, B.Y, BaseZ),
+                                                FVector(Apex2D.X, Apex2D.Y, BaseZ + RidgeHeight),
+                                                Color);
                                 }
                         }
                 }
@@ -1511,11 +2852,12 @@ void FGeoMeshGenerator::AddSkeletonGabledRoof(
                 float DistA = SignedDistanceToLine(FVector2D(A.X, A.Y), RidgeA, RidgeB);
                 float DistB = SignedDistanceToLine(FVector2D(B.X, B.Y), RidgeA, RidgeB);
 
-                // Edge crosses the ridge line
+                // A boundary edge whose endpoints straddle the ridge line is a
+                // GABLE END edge. Only treat it as a gable end when the ridge
+                // SEGMENT actually reaches near it (so the infinite ridge line
+                // crossing a concave boundary elsewhere doesn't spawn bogus walls).
                 if (DistA * DistB < 0.f)
                 {
-                        // Find intersection point
-                        FVector2D IntersectPt;
                         float EdgeDX = B.X - A.X;
                         float EdgeDY = B.Y - A.Y;
                         float Den = RidgeDir.X * EdgeDY - RidgeDir.Y * EdgeDX;
@@ -1523,16 +2865,21 @@ void FGeoMeshGenerator::AddSkeletonGabledRoof(
                         {
                                 float NumS = RidgeDir.X * ((A.Y) - RidgeA.Y) - RidgeDir.Y * ((A.X) - RidgeA.X);
                                 float S = NumS / Den;
-                                IntersectPt = FVector2D(A.X + S * EdgeDX, A.Y + S * EdgeDY);
+                                FVector2D IntersectPt(A.X + S * EdgeDX, A.Y + S * EdgeDY);
 
-                                // Gable wall: vertical triangle from intersection up to ridge
-                                FVector BotPt(IntersectPt.X, IntersectPt.Y, BaseZ);
-                                FVector TopPt(IntersectPt.X, IntersectPt.Y, BaseZ + RidgeHeight);
-                                AddQuad(OutRoofData,
+                                // Convexity is guaranteed (concave buildings go to AddSkeletonHippedRoof).
+                                // For a convex polygon cut by any line there are exactly 2 straddling edges,
+                                // so no spurious crossings can exist. The old AlongRidge guard was rejecting
+                                // valid gable walls when the skeleton-detected ridge was shorter than the
+                                // footprint span — removed.
+
+                                // Correct gable wall = single TRIANGLE: the eave edge
+                                // (A,B at BaseZ) up to the apex on the ridge.
+                                FVector Apex(IntersectPt.X, IntersectPt.Y, BaseZ + RidgeHeight);
+                                AddTriangle(OutRoofData,
                                         FVector(A.X, A.Y, BaseZ),
-                                        FVector(A.X, A.Y, BaseZ + RidgeHeight),
-                                        TopPt,
-                                        BotPt,
+                                        FVector(B.X, B.Y, BaseZ),
+                                        Apex,
                                         Color);
                         }
                 }
@@ -1540,8 +2887,181 @@ void FGeoMeshGenerator::AddSkeletonGabledRoof(
         }
         catch (...)
         {
-                UE_LOG(LogTemp, Warning, TEXT("CGAL Skeleton Gabled Roof: Exception caught, falling back to AABB"));
-                AddGabledRoof(OutRoofData, Footprint, BaseZ, RidgeHeight, Color);
+                UE_LOG(LogTemp, Warning, TEXT("CGAL Skeleton Gabled Roof: Exception caught, using hip fallback"));
+                AddSkeletonHippedRoof(OutRoofData, Footprint, BaseZ, RidgeHeight, Color);
+        }
+}
+
+// ============================================================================
+// AddGambrelRoof
+// ============================================================================
+void FGeoMeshGenerator::AddGambrelRoof(
+        FMeshData& OutRoofData,
+        const TArray<FVector>& Footprint,
+        float BaseZ,
+        float RidgeHeight,
+        const FColor& Color,
+        float RoofDirection)
+{
+        if (Footprint.Num() < 3) return;
+
+        // Clean footprint
+        TArray<FVector> CleanFP;
+        for (const FVector& V : Footprint)
+        {
+                FVector P(V.X, V.Y, BaseZ);
+                if (CleanFP.Num() > 0 && P.Equals(CleanFP.Last(), 0.5f)) continue;
+                if (CleanFP.Num() > 0 && P.Equals(CleanFP[0], 0.5f)) continue;
+                CleanFP.Add(P);
+        }
+        if (CleanFP.Num() < 3) return;
+        if (ComputeSignedArea2D(CleanFP) < 0.f) Algo::Reverse(CleanFP);
+
+        // Convert to 2D for skeleton
+        TArray<FVector2D> Poly2D;
+        for (const FVector& V : CleanFP)
+                Poly2D.Add(FVector2D(V.X, V.Y));
+
+        // Generate straight skeleton
+        FCGALSkeletonResult Skeleton = FCGALSkeletonGenerator::GenerateSkeleton(Poly2D);
+        if (!Skeleton.IsValid() || Skeleton.MaxTime < 0.01f)
+        {
+                // Fallback: if skeleton fails, use hipped roof for complex footprints or pyramidal for simple ones
+                if (Footprint.Num() > 5)
+                        AddSkeletonHippedRoof(OutRoofData, Footprint, BaseZ, RidgeHeight, Color);
+                else
+                        AddPyramidalRoof(OutRoofData, Footprint, BaseZ, RidgeHeight, Color);
+                return;
+        }
+
+        const float MaxT = FMath::Max(Skeleton.MaxTime, 1.f);
+        const float SplitProgress = 0.3f;   // 30% of max time = break line
+        const float EdgeBumpFactor = 0.3f;  // steepness factor
+
+        // ========== اصلاح شده: ZForTime ==========
+        auto ZForTime = [&](float T, bool bBottomPart) -> float
+        {
+                float Progress = T / MaxT;  // 0..1
+                if (bBottomPart)
+                {
+                        // Bottom part: progress 0..SplitProgress
+                        float LocalP = FMath::Clamp(Progress / SplitProgress, 0.f, 1.f);
+                        float H = LocalP * (1.f + EdgeBumpFactor);
+                        H = FMath::Clamp(H, 0.f, 1.f);
+                        // Maximum height of bottom part = SplitProgress * RidgeHeight
+                        return BaseZ + (SplitProgress * RidgeHeight) * H;
+                }
+                else
+                {
+                        // Top part: progress SplitProgress..1
+                        float LocalP = (Progress - SplitProgress) / (1.f - SplitProgress);
+                        LocalP = FMath::Clamp(LocalP, 0.f, 1.f);
+                        float H = SplitProgress + LocalP * (1.f - SplitProgress) * (1.f + EdgeBumpFactor);
+                        H = FMath::Clamp(H, 0.f, 1.f);
+                        return BaseZ + RidgeHeight * H;
+                }
+        };
+        // =========================================
+
+        // Boundary check: is vertex on the footprint outline?
+        auto IsOnBoundary = [&](const FVector2D& P) -> bool
+        {
+                for (const FVector2D& B : Poly2D)
+                        if (FVector2D::DistSquared(P, B) < 1.f) return true;
+                return false;
+        };
+
+        // Split each skeleton face into bottom and top parts using the split time
+        for (const FCGALSkeletonFace& Face : Skeleton.Faces)
+        {
+                const int32 NF = Face.VertexIndices.Num();
+                if (NF < 3) continue;
+
+                // Collect vertices with their times
+                TArray<FVector2D> Verts2D;
+                TArray<float> Times;
+                for (int32 Idx : Face.VertexIndices)
+                {
+                        if (Idx < 0 || Idx >= Skeleton.Vertices.Num()) continue;
+                        const FCGALSkeletonVertex& SV = Skeleton.Vertices[Idx];
+                        if (Verts2D.Num() > 0 && FVector2D::DistSquared(Verts2D.Last(), SV.Position) < 1.f) continue;
+                        Verts2D.Add(SV.Position);
+                        Times.Add(IsOnBoundary(SV.Position) ? 0.f : SV.Time);
+                }
+                if (Verts2D.Num() < 3) continue;
+                // Remove last if same as first
+                if (FVector2D::DistSquared(Verts2D[0], Verts2D.Last()) < 1.f)
+                {
+                        Verts2D.Pop();
+                        Times.Pop();
+                }
+
+                // Split polygon at time = SplitProgress * MaxT
+                TArray<FVector2D> BottomVerts, TopVerts;
+                TArray<float> BottomTimes, TopTimes;
+                for (int32 i = 0; i < Verts2D.Num(); i++)
+                {
+                        const FVector2D& A = Verts2D[i];
+                        const FVector2D& B = Verts2D[(i + 1) % Verts2D.Num()];
+                        float tA = Times[i];
+                        float tB = Times[(i + 1) % Verts2D.Num()];
+                        float splitT = SplitProgress * MaxT;
+
+                        // Always add A to appropriate list
+                        if (tA <= splitT)
+                        {
+                                BottomVerts.Add(A);
+                                BottomTimes.Add(tA);
+                        }
+                        else
+                        {
+                                TopVerts.Add(A);
+                                TopTimes.Add(tA);
+                        }
+
+                        // If edge crosses split time, add split point
+                        if ((tA - splitT) * (tB - splitT) < 0.f)
+                        {
+                                float t = (splitT - tA) / (tB - tA);
+                                FVector2D SplitPt = A + (B - A) * t;
+                                BottomVerts.Add(SplitPt);
+                                BottomTimes.Add(splitT);
+                                TopVerts.Add(SplitPt);
+                                TopTimes.Add(splitT);
+                        }
+                }
+
+                // Triangulate bottom part (steep slope)
+                if (BottomVerts.Num() >= 3)
+                {
+                        TArray<int32> BottomTris;
+                        TriangulatePolygon2D(BottomVerts, BottomTris);
+                        for (int32 t = 0; t + 2 < BottomTris.Num(); t += 3)
+                        {
+                                int32 i0 = BottomTris[t], i1 = BottomTris[t+1], i2 = BottomTris[t+2];
+                                FVector V0(BottomVerts[i0].X, BottomVerts[i0].Y, ZForTime(BottomTimes[i0], true));
+                                FVector V1(BottomVerts[i1].X, BottomVerts[i1].Y, ZForTime(BottomTimes[i1], true));
+                                FVector V2(BottomVerts[i2].X, BottomVerts[i2].Y, ZForTime(BottomTimes[i2], true));
+                                if (FVector::CrossProduct(V1 - V0, V2 - V0).Z < 0.f) Swap(V1, V2);
+                                AddTriangle(OutRoofData, V0, V1, V2, Color);
+                        }
+                }
+
+                // Triangulate top part (shallow slope)
+                if (TopVerts.Num() >= 3)
+                {
+                        TArray<int32> TopTris;
+                        TriangulatePolygon2D(TopVerts, TopTris);
+                        for (int32 t = 0; t + 2 < TopTris.Num(); t += 3)
+                        {
+                                int32 i0 = TopTris[t], i1 = TopTris[t+1], i2 = TopTris[t+2];
+                                FVector V0(TopVerts[i0].X, TopVerts[i0].Y, ZForTime(TopTimes[i0], false));
+                                FVector V1(TopVerts[i1].X, TopVerts[i1].Y, ZForTime(TopTimes[i1], false));
+                                FVector V2(TopVerts[i2].X, TopVerts[i2].Y, ZForTime(TopTimes[i2], false));
+                                if (FVector::CrossProduct(V1 - V0, V2 - V0).Z < 0.f) Swap(V1, V2);
+                                AddTriangle(OutRoofData, V0, V1, V2, Color);
+                        }
+                }
         }
 }
 
@@ -1744,31 +3264,383 @@ TArray<FVector> FGeoMeshGenerator::CleanFootprint(
 // ============================================================================
 // GenerateRoofMeshes
 // ============================================================================
+// ----------------------------------------------------------------------------
+// IsColorOnlyBuilding - towers, churches and other landmark structures keep
+// their plain OSM colour instead of the tiled facade/roof atlas. Their tall or
+// ornate shapes (spires, domes, naves) don't suit a repeating window facade.
+// ----------------------------------------------------------------------------
+static bool IsColorOnlyBuilding(const FGeoBuilding& B)
+{
+        const FString T = B.BuildingTypeStr.ToLower();
+        const FString N = B.Name.ToLower();
+
+        // OSM building= / amenity values that denote churches, places of worship
+        // and free-standing towers.
+        static const TCHAR* TypeKeys[] = {
+                TEXT("church"), TEXT("cathedral"), TEXT("chapel"), TEXT("basilica"),
+                TEXT("minster"), TEXT("monastery"), TEXT("mosque"), TEXT("synagogue"),
+                TEXT("temple"), TEXT("shrine"), TEXT("religious"), TEXT("place_of_worship"),
+                TEXT("tower"), TEXT("bell_tower"), TEXT("belfry"), TEXT("steeple"),
+                TEXT("campanile")
+        };
+        for (const TCHAR* K : TypeKeys)
+                if (T.Contains(K)) return true;
+
+        // Common church/tower words in the building name (multilingual).
+        static const TCHAR* NameKeys[] = {
+                TEXT("church"), TEXT("kirche"), TEXT("cathedral"), TEXT("münster"),
+                TEXT("munster"), TEXT("kapelle"), TEXT("basilica"), TEXT("tower"),
+                TEXT("turm")
+        };
+        for (const TCHAR* K : NameKeys)
+                if (N.Contains(K)) return true;
+
+        // Spire-like roofs are almost always towers / churches.
+        if (B.RoofShape == ERoofShape::Onion || B.RoofShape == ERoofShape::Dome)
+                return true;
+
+        return false;
+}
+
+// ----------------------------------------------------------------------------
+// IsBuildingHasWindows - mirrors streets.gl logic: certain building types
+// (garages, greenhouses, silos, barns, etc.) never have windows.
+// Also, if the wall height is too short (< 2 m), no windows.
+// ----------------------------------------------------------------------------
+static bool IsBuildingHasWindows(const FGeoBuilding& B)
+{
+        const FString T = B.BuildingTypeStr.ToLower();
+
+        // Building types that never have windows (from streets.gl isBuildingHasWindows)
+        static const TCHAR* NoWindowTypes[] = {
+                TEXT("garage"), TEXT("garages"), TEXT("greenhouse"),
+                TEXT("storage_tank"), TEXT("bunker"), TEXT("silo"),
+                TEXT("stadium"), TEXT("ship"), TEXT("castle"),
+                TEXT("service"), TEXT("digester"), TEXT("water_tower"),
+                TEXT("shed"), TEXT("ger"), TEXT("barn"),
+                TEXT("slurry_tank"), TEXT("container"), TEXT("carport"),
+                TEXT("roof")
+        };
+        for (const TCHAR* K : NoWindowTypes)
+                if (T == K) return false;
+
+        // Color-only buildings (churches, towers, etc.) also have no windows
+        if (IsColorOnlyBuilding(B)) return false;
+
+        return true;
+}
+
+// ----------------------------------------------------------------------------
+// FWindowParams - per-building window parameters derived from building type
+// and height, following the streets.gl approach.
+//
+// Key insight from streets.gl source code (WallsBuilder.ts + VectorAreaHandler.ts):
+//   - windowWidth = 4 metres for ALL facade materials (plaster, brick, wood,
+//     cementBlock, glass). This means one window every 4 m of wall length.
+//   - Window count per wall = round(wallLength / windowWidth), then the
+//     window texture tiles exactly windowCount times across the wall.
+//   - UV V-axis is scaled by `levels`, so each floor maps to one texture repeat.
+//   - If buildingWindows is false: textureIdWindow = textureIdWall (no window
+//     texture, just wall texture everywhere).
+//   - The window texture (e.g. FacadePlasterWindow) composites the window
+//     glass cut-out on top of the wall background — no separate overlay needed.
+// ----------------------------------------------------------------------------
+struct FWindowParams
+{
+        float WindowSlotWidth;   // wall length per window slot (cm) — streets.gl: 400
+};
+
+// Returns window slot width based on building type and height.
+// In streets.gl, windowWidth = 4 m for ALL materials. We use the same
+// default but allow slight variation for industrial buildings.
+// BuildingType: 0=residential, 1=commercial, 2=industrial, 3=other
+// NumLevels: number of floors
+// BuildingH: total building height in cm
+static FWindowParams GetWindowParams(int32 BuildingType, int32 NumLevels, float BuildingH)
+{
+        FWindowParams P;
+        // streets.gl: windowWidth = 4 m for all facade materials
+        P.WindowSlotWidth = 400.f;    // 4 m per window slot (matches streets.gl exactly)
+
+        // Industrial buildings have fewer, more widely-spaced windows
+        if (BuildingType == 2)
+        {
+                P.WindowSlotWidth = 500.f;    // 5 m per window slot (fewer windows)
+        }
+
+        return P;
+}
+
+// ----------------------------------------------------------------------------
+// Texture-atlas slice indices. MUST match the streets-gl ExtrudedTextures order
+// and the TA_Building Texture2DArray slice order (files T_00..T_20). The atlas
+// material reads the slice from TexCoord[1].R (= UV1.x).
+// ----------------------------------------------------------------------------
+namespace TokhdoruAtlas
+{
+        enum
+        {
+                RoofGeneric1 = 0, RoofGeneric2 = 1, RoofGeneric3 = 2, RoofGeneric4 = 3,
+                RoofTiles = 4, RoofMetal = 5, RoofConcrete = 6, RoofThatch = 7,
+                RoofEternit = 8, RoofGrass = 9, RoofGlass = 10, RoofTar = 11,
+                FacadeGlass = 12, FacadeBrickWall = 13, FacadeBrickWindow = 14,
+                FacadePlasterWall = 15, FacadePlasterWindow = 16, FacadeWoodWall = 17,
+                FacadeWoodWindow = 18, FacadeBlockWall = 19, FacadeBlockWindow = 20,
+        };
+}
+
+// FacadeMaterialType: 0=plaster, 1=brick, 2=dark_stone, 3=light_stone.
+static float FacadeWallSlice(int32 FacadeMaterialType)
+{
+        switch (FacadeMaterialType)
+        {
+        case 1:  return (float)TokhdoruAtlas::FacadeBrickWall;   // brick
+        case 2:  return (float)TokhdoruAtlas::FacadeBlockWall;   // dark stone -> concrete block
+        case 3:  return (float)TokhdoruAtlas::FacadePlasterWall; // light stone -> plaster
+        default: return (float)TokhdoruAtlas::FacadePlasterWall; // plaster / default
+        }
+}
+
+// Returns the window-panel atlas slice that matches the facade material.
+// Each wall material has a paired window slice (brickWindow, plasterWindow, ...)
+// that overlays the window glass cut-out pattern on the correct wall texture.
+// Glass curtain-walls (FacadeGlass) have no separate window slice — the glass
+// panel itself IS the window, so we fall back to FacadeGlass.
+static float FacadeWindowSlice(int32 FacadeMaterialType)
+{
+        switch (FacadeMaterialType)
+        {
+        case 1:  return (float)TokhdoruAtlas::FacadeBrickWindow;    // brick + window cutout
+        case 2:  return (float)TokhdoruAtlas::FacadeBlockWindow;    // block + window cutout
+        case 3:  return (float)TokhdoruAtlas::FacadePlasterWindow;  // plaster + window cutout
+        default: return (float)TokhdoruAtlas::FacadePlasterWindow;  // plaster / default
+        }
+}
+
+// Roof slice from OSM roof:material. Flat default roofs cycle the 4 generic
+// textures; non-flat default roofs use concrete (mirrors streets-gl).
+static float RoofSlice(const FGeoBuilding& B, int32 BuildingIndex)
+{
+        const FString M = B.RoofMaterial.ToLower();
+        if (M == TEXT("tiles"))    return (float)TokhdoruAtlas::RoofTiles;
+        if (M == TEXT("metal"))    return (float)TokhdoruAtlas::RoofMetal;
+        if (M == TEXT("concrete")) return (float)TokhdoruAtlas::RoofConcrete;
+        if (M == TEXT("thatch"))   return (float)TokhdoruAtlas::RoofThatch;
+        if (M == TEXT("eternit"))  return (float)TokhdoruAtlas::RoofEternit;
+        if (M == TEXT("grass"))    return (float)TokhdoruAtlas::RoofGrass;
+        if (M == TEXT("glass"))    return (float)TokhdoruAtlas::RoofGlass;
+        if (M == TEXT("tar"))      return (float)TokhdoruAtlas::RoofTar;
+
+        if (B.RoofShape == ERoofShape::Flat)
+        {
+                // Churches / landmarks must NOT use the generic roof textures (00-03);
+                // give their flat roofs a plain concrete slice instead.
+                if (IsColorOnlyBuilding(B))
+                        return (float)TokhdoruAtlas::RoofConcrete;
+
+                static const int32 Generic[4] = {
+                        TokhdoruAtlas::RoofGeneric1, TokhdoruAtlas::RoofGeneric2,
+                        TokhdoruAtlas::RoofGeneric3, TokhdoruAtlas::RoofGeneric4 };
+                return (float)Generic[((BuildingIndex % 4) + 4) % 4];
+        }
+        return (float)TokhdoruAtlas::RoofConcrete;
+}
+
+// Stamp UV1.x = Slice for every vertex appended since `Start` (UV1.y unused).
+// We use SetNum (not SetNumZeroed) so that atlas slices written by previous
+// buildings earlier in the same shared buffer are never overwritten with zero.
+static void FillSliceUV1(FGeoMeshGenerator::FMeshData& D, int32 Start, float Slice)
+{
+        if (D.Vertices.Num() <= Start) return;
+        // Grow UV1 to match Vertices without zeroing existing entries.
+        if (D.UV1.Num() < D.Vertices.Num())
+                D.UV1.SetNum(D.Vertices.Num());
+        for (int32 i = Start; i < D.Vertices.Num(); ++i)
+                D.UV1[i] = FVector2D(Slice, 0.f);
+}
+
+// Emit a single OUTWARD-facing vertical quad (corner order BL, BR, TR, TL) using
+// the SAME triangle winding + normal convention as AddExtrudedPolygon's walls.
+// AddQuad() winds the opposite way, so vertical AddQuad faces (e.g. windows) end
+// up back-face culled / lit from the inside. Window & curtain-glass faces must
+// use this helper so they read correctly from the street. Normals are baked here
+// (outward), so the glass section must NOT be run through RecomputeNormals().
+//
+// UV parameters (U0,U1,V0,V1) default to wall-coordinate space for backward
+// compatibility. When using streets.gl window-texture mode, pass:
+//   U0 = 0, U1 = windowCount  (one texture repeat per window slot)
+//   V0 = 0, V1 = levels       (one texture repeat per floor)
+static void AddOutwardWallQuad(
+        FGeoMeshGenerator::FMeshData& MD,
+        const FVector& BL, const FVector& BR,
+        const FVector& TR, const FVector& TL,
+        const FColor& Color,
+        float U0 = -1.f, float U1 = -1.f,
+        float V0 = -1.f, float V1 = -1.f)
+{
+        FVector EdgeDir = BR - BL;
+        FVector OutN(EdgeDir.Y, -EdgeDir.X, 0.f);
+        if (!OutN.IsNearlyZero()) OutN.Normalize(); else OutN = FVector(0, 0, 1);
+        FVector Tang = EdgeDir; if (!Tang.IsNearlyZero()) Tang.Normalize(); else Tang = FVector(1, 0, 0);
+
+        const int32 BI = MD.Vertices.Num();
+        MD.Vertices.Add(BL); MD.Vertices.Add(BR); MD.Vertices.Add(TR); MD.Vertices.Add(TL);
+        // Same winding as AddExtrudedPolygon: (0,2,1) + (0,3,2).
+        MD.Triangles.Add(BI + 0); MD.Triangles.Add(BI + 2); MD.Triangles.Add(BI + 1);
+        MD.Triangles.Add(BI + 0); MD.Triangles.Add(BI + 3); MD.Triangles.Add(BI + 2);
+
+        // If UV params are negative, use wall-coordinate space (metres) —
+        // this preserves backward compatibility with existing callers.
+        if (U0 < 0.f)
+        {
+                const float WW = FVector2D::Distance(FVector2D(BL.X, BL.Y), FVector2D(BR.X, BR.Y)) / 100.f;
+                MD.UV0.Add(FVector2D(0.f, BL.Z / 100.f)); MD.UV0.Add(FVector2D(WW, BR.Z / 100.f));
+                MD.UV0.Add(FVector2D(WW, TR.Z / 100.f)); MD.UV0.Add(FVector2D(0.f, TL.Z / 100.f));
+        }
+        else
+        {
+                // Explicit UV (streets.gl window-texture mode)
+                MD.UV0.Add(FVector2D(U0, V0)); MD.UV0.Add(FVector2D(U1, V0));
+                MD.UV0.Add(FVector2D(U1, V1)); MD.UV0.Add(FVector2D(U0, V1));
+        }
+        for (int32 v = 0; v < 4; v++)
+        {
+                MD.Normals.Add(OutN);
+                MD.VertexColors.Add(Color);
+                MD.Tangents.Add(FProcMeshTangent(Tang, false));
+        }
+}
+
+// ----------------------------------------------------------------------------
+// AddBoxFace — a single quad with an EXPLICIT normal (used by the 3D frame bars).
+// V0,V1,V2,V3 are in order that produces the correct face with the given Normal.
+// ----------------------------------------------------------------------------
+static void AddBoxFace(
+        FGeoMeshGenerator::FMeshData& MD,
+        const FVector& V0, const FVector& V1,
+        const FVector& V2, const FVector& V3,
+        const FVector& Normal, const FColor& Color)
+{
+        FVector Tang = (V1 - V0);
+        if (!Tang.IsNearlyZero()) Tang.Normalize(); else Tang = FVector(1, 0, 0);
+
+        const int32 BI = MD.Vertices.Num();
+        MD.Vertices.Add(V0); MD.Vertices.Add(V1); MD.Vertices.Add(V2); MD.Vertices.Add(V3);
+        MD.Triangles.Add(BI + 0); MD.Triangles.Add(BI + 1); MD.Triangles.Add(BI + 2);
+        MD.Triangles.Add(BI + 0); MD.Triangles.Add(BI + 2); MD.Triangles.Add(BI + 3);
+
+        // UV0: horizontal distance in metres, vertical in metres
+        const float W = FVector2D::Distance(FVector2D(V0.X, V0.Y), FVector2D(V1.X, V1.Y)) / 100.f;
+        const float H0 = V0.Z / 100.f, H1 = V1.Z / 100.f, H2 = V2.Z / 100.f, H3 = V3.Z / 100.f;
+        MD.UV0.Add(FVector2D(0.f, H0));
+        MD.UV0.Add(FVector2D(W,  H1));
+        MD.UV0.Add(FVector2D(W,  H2));
+        MD.UV0.Add(FVector2D(0.f, H3));
+
+        for (int32 v = 0; v < 4; v++)
+        {
+                MD.Normals.Add(Normal);
+                MD.VertexColors.Add(Color);
+                MD.Tangents.Add(FProcMeshTangent(Tang, false));
+        }
+}
+
+// ----------------------------------------------------------------------------
+// AddFrameBar3D — build a 3D rectangular bar for a window frame.
+//
+// BBL, BBR, BTR, BTL are the 4 corners of the back face (against the wall /
+// glass surface), in the SAME order as AddOutwardWallQuad (BL, BR, TR, TL).
+// Protrusion is the vector from back to front (direction + magnitude = depth).
+// The bar has 5 visible faces (front, top, bottom, left-cap, right-cap).
+// The back face is skipped — it sits against the wall or is hidden by glass.
+// ----------------------------------------------------------------------------
+static void AddFrameBar3D(
+        FGeoMeshGenerator::FMeshData& MD,
+        const FVector& BBL, const FVector& BBR,
+        const FVector& BTR, const FVector& BTL,
+        const FVector& Protrusion,
+        const FColor& Color)
+{
+        // Front face corners
+        FVector FBL = BBL + Protrusion;
+        FVector FBR = BBR + Protrusion;
+        FVector FTR = BTR + Protrusion;
+        FVector FTL = BTL + Protrusion;
+
+        // Normal for front face
+        FVector FrontN = Protrusion;
+        if (!FrontN.IsNearlyZero()) FrontN.Normalize();
+        else FrontN = FVector(0, 0, 1);
+
+        // Edge direction (along the bar length, from left to right)
+        FVector EdgeDir = BBR - BBL;
+        FVector SideN(EdgeDir.Y, -EdgeDir.X, 0.f);   // outward perpendicular in XY
+        if (!SideN.IsNearlyZero()) SideN.Normalize();
+        else SideN = FVector(1, 0, 0);
+        FVector InwardN = -SideN;                      // toward glass opening
+
+        // 1) Front face (facing the street)
+        AddBoxFace(MD, FBL, FBR, FTR, FTL, FrontN, Color);
+
+        // 2) Top face (if bar has height, the top face is visible)
+        AddBoxFace(MD, BTL, BTR, FTR, FTL, FVector(0, 0, 1), Color);
+
+        // 3) Bottom face
+        AddBoxFace(MD, BBL, FBL, FBR, BBR, FVector(0, 0, -1), Color);
+
+        // 4) Inner face (facing the glass opening — the reveal)
+        AddBoxFace(MD, BBR, BTR, FTR, FBR, InwardN, Color);
+
+        // 5) Outer face (facing away from the glass — the outer reveal)
+        AddBoxFace(MD, BBL, FBL, FTL, BTL, SideN, Color);
+}
+
 void FGeoMeshGenerator::GenerateRoofMeshes(
         const TArray<FGeoBuilding>& Buildings,
-        FMeshData& OutRoofData)
+        FMeshData& OutRoofData,
+        FMeshData& OutRoofColorData)
 {
         OutRoofData.Reset();
+        OutRoofColorData.Reset();
+
+        int32 RoofCounter = 0;
 
         const float FoundationHeight = 50.0f;
-        const float DefaultRoofPitch = 0.4f;
+        const float DefaultRoofPitch = 1.0f;
 
         for (const FGeoBuilding& Building : Buildings)
         {
                 if (Building.Nodes.Num() < 3) continue;
+                // Outline covered by building:parts: parts define the roof, skip outline.
+                if (Building.bSuppressOutline) continue;
+                // Part whose flat roof cap is hidden by another part sitting on top.
+                if (Building.bSuppressRoof) continue;
+
+                const int32 RoofIndex = RoofCounter++;
 
                 TArray<FVector> LocalFootprint;
                 for (const FVector2D& N : Building.Nodes)
-                        LocalFootprint.Add(FVector(N.X * ScaleFactor, N.Y * ScaleFactor, 0.f));
+                        LocalFootprint.Add(FVector(N.X * ScaleFactor, -N.Y * ScaleFactor, 0.f));
 
                 float BuildingH = (float)(Building.Height * (double)ScaleFactor);
                 if (BuildingH < 100.f) BuildingH = 300.f;
                 float MinH = (float)(Building.MinHeight * (double)ScaleFactor);
-                float EffBase = FMath::Max(MinH, FoundationHeight);
-                float WallTopZ = EffBase + BuildingH;
 
                 FColor RoofFColor = LinearToFColor(Building.RoofColor);
 
+                float RoofMinX, RoofMaxX, RoofMinY, RoofMaxY;
+                ComputeFootprintBounds(LocalFootprint, RoofMinX, RoofMaxX, RoofMinY, RoofMaxY);
+                const float HalfShort = FMath::Min(RoofMaxX - RoofMinX, RoofMaxY - RoofMinY) * 0.5f;
+
+                // --- Roof height -------------------------------------------------
+                // bRoofHeightExplicit: the roof's vertical extent came straight from
+                // OSM (roof:height / roof:levels). In that case OSM's `height` is the
+                // ABSOLUTE TOTAL height INCLUDING the roof, so the wall top must be
+                // lowered to (height - roof:height) and the roof fills the top RoofH.
+                // When no explicit roof height exists we SYNTHESISE a pitch; then
+                // OSM's `height` is the eaves/wall height and the roof is added on
+                // top (no lowering), matching the historical behaviour.
+                bool bRoofHeightExplicit = (Building.RoofHeight > 0.0) || (Building.RoofLevels > 0);
                 float RoofH = 0.f;
                 if (Building.RoofHeight > 0.0)
                 {
@@ -1780,45 +3652,215 @@ void FGeoMeshGenerator::GenerateRoofMeshes(
                 }
                 else
                 {
-                        float MinX, MaxX, MinY, MaxY;
-                        ComputeFootprintBounds(LocalFootprint, MinX, MaxX, MinY, MaxY);
-                        float HalfShort = FMath::Min(MaxX - MinX, MaxY - MinY) * 0.5f;
                         RoofH = FMath::Max(50.f, HalfShort * DefaultRoofPitch);
                 }
 
-                AddRoofGeometry(OutRoofData, Building.RoofShape, LocalFootprint, WallTopZ, RoofH, RoofFColor);
+                // Prominence floor for PITCHED roofs: most OSM buildings carry no
+                // roof:height, so the loader hands us a weak ~3 m default that makes
+                // gabled/hipped roofs read almost flat. Give pitched shapes a pitch
+                // proportional to the building's short side (~30°), matching the
+                // streets.gl look, while leaving tall explicit roofs untouched.
+                switch (Building.RoofShape)
+                {
+                case ERoofShape::Gabled:
+                case ERoofShape::Saltbox:
+                case ERoofShape::QuadrupleSaltbox:
+                case ERoofShape::CrossGabled:
+                case ERoofShape::Hipped:
+                case ERoofShape::HalfHipped:
+                case ERoofShape::Pyramidal:
+                case ERoofShape::Mansard:
+                case ERoofShape::Gambrel:
+                        if (HalfShort > 1.f && !bRoofHeightExplicit)
+                                RoofH = FMath::Max(RoofH, HalfShort * 2.0f);
+                        break;
+                case ERoofShape::Dome:
+                        // Hemisphere ≈ radius tall.
+                        if (HalfShort > 1.f && !bRoofHeightExplicit)
+                                RoofH = FMath::Max(RoofH, HalfShort * 2.0f);
+                        break;
+                case ERoofShape::Onion:
+                        // Onion height grows SUB-linearly with width: a narrow tower bulb
+                        // reads tall and slender, while a wide bulb stays proportionally
+                        // shorter (a pure ratio makes wide domes balloon and narrow ones
+                        // look stubby). Linear floor calibrated on real domes — a ~1.4 m
+                        // radius bulb → ~3.6 m tall, a ~3.1 m radius bulb → ~4.5 m. The
+                        // constant is expressed in ScaleFactor units so it stays correct
+                        // if the world scale changes.
+                        if (HalfShort > 1.f && !bRoofHeightExplicit)
+                                RoofH = FMath::Max(RoofH, 2.82f * ScaleFactor + 0.535f * HalfShort);
+                        break;
+                default:
+                        break;
+                }
+
+                // For building:parts, Height and MinHeight are ABSOLUTE from ground.
+                // EffBase = the start of this part's walls; AbsTop = absolute peak.
+                // For plain buildings, Height is relative: AbsTop = EffBase + Height.
+                float EffBase, AbsTop;
+                if (Building.bIsBuildingPart)
+                {
+                        EffBase = (MinH > 10.f) ? MinH : FoundationHeight;
+                        AbsTop = FMath::Max(BuildingH, EffBase + 10.f);
+                }
+                else
+                {
+                        EffBase = FMath::Max(MinH, FoundationHeight);
+                        AbsTop = EffBase + BuildingH;
+                }
+
+                // Onion/dome turret: drop its column down to the surrounding roofline so
+                // the dome rises out of the adjacent pitched roof instead of standing on
+                // a full-height column. Only when a pitched neighbour shares an edge.
+                if (Building.RoofShape == ERoofShape::Onion || Building.RoofShape == ERoofShape::Dome)
+                {
+                        float Eave = DomeNestleEave(Building, Buildings, ScaleFactor, AbsTop, EffBase);
+                        if (Eave > 0.f)
+                                AbsTop = Eave;
+                }
+
+                // Round (barrel) roof without an explicit roof:height: the semicircle
+                // must sit WITHIN the building's total height (walls lowered by the arch
+                // radius), exactly like an explicit roof height — otherwise the barrel
+                // floats on top of full-height walls. Derive the rise from the footprint
+                // (in local units here) and treat it as roof-inside-height.
+               bool bRoofInsideHeight = bRoofHeightExplicit;
+                // Round بدون explicit: barrel rise را محاسبه می‌کنیم
+                if (Building.RoofShape == ERoofShape::Round && !bRoofHeightExplicit)
+                {
+                float Rise = ComputeBarrelRise(LocalFootprint, Building.RoofOrientation);
+                if (Rise > 1.f) { RoofH = Rise; bRoofInsideHeight = true; }
+                }
+                // ← اضافه کن: تمام pitched shapes با explicit roof height
+                // باید WallTopZ را پایین بکشند، نه فقط Round
+                if (bRoofHeightExplicit && RoofShapeHasEave(Building.RoofShape))
+                {
+                bRoofInsideHeight = true;
+                }
+                // Skillion shoulder handling:
+                //  • If it touches an onion/dome turret, slope its low edge all the way
+                //    down to the shared complex roofline so it ATTACHES to the lowered
+                //    dome column (stretches toward the dome) instead of floating above it.
+                //  • Otherwise just soften any over-steep small skillion.
+                if (Building.RoofShape == ERoofShape::Skillion)
+                {
+                        float AttachEave = IsAdjacentToOnionDome(Building, Buildings)
+                                ? DomeNestleEave(Building, Buildings, ScaleFactor, AbsTop, EffBase) : -1.f;
+                        if (AttachEave > 0.f)
+                                RoofH = AbsTop - AttachEave;
+                        else
+                                RoofH = GentleSkillionRise(LocalFootprint, (float)Building.RoofDirection, RoofH);
+                }
+
+                // WallTopZ: where walls end and the roof begins. With an explicit roof
+                // height OSM's height already includes the roof, so walls stop at
+                // AbsTop - RoofH and the roof occupies the top RoofH (peak == AbsTop).
+                float WallTopZ = AbsTop;
+                if (bRoofInsideHeight)
+                {
+                        WallTopZ = FMath::Max(EffBase + 10.f, AbsTop - RoofH);
+                        RoofH = AbsTop - WallTopZ; // never poke above the absolute top
+                }
+
+                // Inner courtyard rings (holes), in the same scaled 2D space as
+                // the footprint, so the roof can exclude them.
+                TArray<TArray<FVector2D>> HoleRings2D;
+                for (const TArray<FVector2D>& Hole : Building.Holes)
+                {
+                        if (Hole.Num() < 3) continue;
+                        TArray<FVector2D> Ring;
+                        Ring.Reserve(Hole.Num());
+                        for (const FVector2D& H : Hole)
+                                Ring.Add(FVector2D(H.X * ScaleFactor, -H.Y * ScaleFactor));
+                        HoleRings2D.Add(MoveTemp(Ring));
+                }
+
+                // RoofDirection: -1 if not set in OSM (auto-detect from AABB/skeleton)
+                float RoofDir = (float)Building.RoofDirection; // -1 = not specified
+
+                // Flat roofs of ordinary buildings get the textured atlas; every
+                // other roof (pitched, domed, ...) and any tower/church roof keeps
+                // its plain OSM colour. Route to the matching mesh section.
+                //
+                // QuadrupleSaltbox without an explicit roof:height is almost always
+                // a mapper error on flat commercial/retail buildings (e.g. Way 85765746).
+                // Downgrade to Flat so we don't generate a pitched skeleton roof on
+                // a building that is clearly intended to have no visible pitch.
+                ERoofShape EffectiveRoofShape = Building.RoofShape;
+                if (EffectiveRoofShape == ERoofShape::QuadrupleSaltbox && !bRoofHeightExplicit)
+                        EffectiveRoofShape = ERoofShape::Flat;
+
+                const bool bColorOnly = IsColorOnlyBuilding(Building);
+                const bool bAtlasRoof = (EffectiveRoofShape == ERoofShape::Flat) && !bColorOnly;
+                FMeshData& RoofTarget = bAtlasRoof ? OutRoofData : OutRoofColorData;
+
+                const int32 VertsBefore = RoofTarget.Vertices.Num();
+                const int32 TrisBefore = RoofTarget.Triangles.Num();
+                AddRoofGeometry(RoofTarget, EffectiveRoofShape, LocalFootprint, WallTopZ, RoofH, RoofFColor,
+                        HoleRings2D, RoofDir, Building.RoofOrientation, LinearToFColor(Building.WallColor));
+
+                // Safety net (fixes "some roofs are missing"): if the shape-specific
+                // builder degenerated and emitted no triangles, the building would be
+                // left open at the top. Guarantee a closed roof by capping it with a
+                // robust flat CDT roof flush with the wall top.
+                if (RoofTarget.Triangles.Num() == TrisBefore)
+                {
+                        if (RoofTarget.Vertices.Num() > VertsBefore)
+                        {
+                                RoofTarget.Vertices.SetNum(VertsBefore);
+                                RoofTarget.Normals.SetNum(VertsBefore);
+                                RoofTarget.VertexColors.SetNum(VertsBefore);
+                                RoofTarget.Tangents.SetNum(VertsBefore);
+                                RoofTarget.UV0.SetNum(VertsBefore);
+                        }
+                        AddRoofGeometry(RoofTarget, ERoofShape::Flat, LocalFootprint, WallTopZ, RoofH, RoofFColor,
+                                HoleRings2D, RoofDir, Building.RoofOrientation);
+                }
+
+                // Stamp the chosen roof atlas slice into UV1 for this building.
+                FillSliceUV1(RoofTarget, VertsBefore, RoofSlice(Building, RoofIndex));
         }
 
         RecomputeNormals(OutRoofData);
         RecomputeTangents(OutRoofData);
+        RecomputeNormals(OutRoofColorData);
+        RecomputeTangents(OutRoofColorData);
 }
 
 // ============================================================================
 // GenerateBuildingMeshes (with windows, facade materials, etc.)
 // ============================================================================
+// OutWindowData receives the wall-inset window panels (brick_window, plaster_window,
+// wood_window, block_window slices). They are separate from OutGlassData so the
+// material can sample the matching *_Window atlas slice (which composites the window
+// cut-out on top of the wall texture) rather than the plain glass slice.
 void FGeoMeshGenerator::GenerateBuildingMeshes(
         const TArray<FGeoBuilding>& Buildings,
         FMeshData& OutWallData, FMeshData& OutGlassData,
-        FMeshData& OutBrickData, FMeshData& OutDarkStoneData, FMeshData& OutLightStoneData)
+        FMeshData& OutBrickData, FMeshData& OutDarkStoneData, FMeshData& OutLightStoneData,
+        FMeshData& OutColorWallData, FMeshData& OutWindowData,
+        FMeshData& OutWindowFrameData, FMeshData& OutWindowGlassData)
 {
         OutWallData.Reset(); OutGlassData.Reset();
         OutBrickData.Reset(); OutDarkStoneData.Reset(); OutLightStoneData.Reset();
+        OutColorWallData.Reset(); OutWindowData.Reset();
+        OutWindowFrameData.Reset(); OutWindowGlassData.Reset();
 
-        FColor WallColor(180, 170, 160), GlassColor(100, 150, 220, 200), FoundationColor(120, 115, 110);
+        // Glass: a desaturated, slightly dark blue-grey reads as real window glass
+        // at city scale (the old saturated sky-blue tinted whole facades blue).
+        FColor WallColor(180, 170, 160), GlassColor(92, 110, 130, 255), FoundationColor(120, 115, 110);
 
         const float FoundationHeight = 50.f;
-        const float MinEdgeForWindows = 300.f;
-        const float WindowSpacingCm = 200.f;
-        const float WindowOutset = 5.f;
-        const float WindowMarginRatio = 0.1f;
 
         for (const FGeoBuilding& Building : Buildings)
         {
                 if (Building.Nodes.Num() < 3) continue;
+                // Outline covered by building:parts: parts define the walls, skip outline.
+                if (Building.bSuppressOutline) continue;
 
                 TArray<FVector> LocalFootprint;
                 for (const FVector2D& N : Building.Nodes)
-                        LocalFootprint.Add(FVector(N.X * ScaleFactor, N.Y * ScaleFactor, 0.f));
+                        LocalFootprint.Add(FVector(N.X * ScaleFactor, -N.Y * ScaleFactor, 0.f));
 
                 float BuildingH = (float)(Building.Height * (double)ScaleFactor);
                 if (BuildingH < 100.f) BuildingH = 300.f;
@@ -1829,21 +3871,140 @@ void FGeoMeshGenerator::GenerateBuildingMeshes(
                 int32 NumLevels = Building.Levels > 0 ? Building.Levels : FMath::Max(1, FMath::RoundToInt(BuildingH / 350.f));
                 float LevelH = BuildingH / (float)NumLevels;
 
-                if (MinH < 10.f)
-                        AddExtrudedPolygon(OutWallData, LocalFootprint, 0.f, FoundationHeight, FoundationColor, false);
+                // Per-building diagnostics: see exactly what heights OSM produced.
+                // Heights are printed in METERS (BuildingH is in UE units = m * ScaleFactor).
+                UE_LOG(LogTemp, Log,
+                        TEXT("Tokhdoru[Bld] '%s' part=%d type=%d roofShape=%d  Height=%.1fm MinHeight=%.1fm Levels=%d (NumLevels=%d) RoofHeight=%.1fm"),
+                        *Building.Name,
+                        Building.bIsBuildingPart ? 1 : 0,
+                        Building.BuildingType,
+                        (int32)Building.RoofShape,
+                        BuildingH / ScaleFactor,
+                        MinH / ScaleFactor,
+                        Building.Levels,
+                        NumLevels,
+                        (float)Building.RoofHeight);
 
-                float EffBase = FMath::Max(WallBase, FoundationHeight);
-                float WallTop = EffBase + BuildingH;
+                // Only add a foundation slab when the building (or part) genuinely
+                // starts at ground level (MinH < 10 cm in UE units).
+                // For building:parts that sit elevated above ground (MinH > 0, e.g.
+                // the towers of the Frauenkirche), skipping the foundation prevents
+                // the spurious solid panel that would fill the gap between the two towers.
+                // Towers / churches keep their plain OSM colour (no facade atlas).
+                const bool bColorOnly = IsColorOnlyBuilding(Building);
+
+                // Capture per-array vertex counts so we can stamp this building's
+                // atlas slice into UV1 for exactly the geometry it adds.
+                const int32 UV1_Wall  = OutWallData.Vertices.Num();
+                const int32 UV1_Brick = OutBrickData.Vertices.Num();
+                const int32 UV1_Dark  = OutDarkStoneData.Vertices.Num();
+                const int32 UV1_Light = OutLightStoneData.Vertices.Num();
+                const int32 UV1_Color = OutColorWallData.Vertices.Num();
+                const int32 UV1_Glass  = OutGlassData.Vertices.Num();
+                // OutWindowData: wall-inset window panels with material-matched slice.
+                const int32 UV1_Window = OutWindowData.Vertices.Num();
+                // 3D window frame + glass: frame uses the wall slice, glass uses FacadeGlass.
+                const int32 UV1_Frame = OutWindowFrameData.Vertices.Num();
+                const int32 UV1_WGlass = OutWindowGlassData.Vertices.Num();
+
+                if (MinH < 10.f)
+                        AddExtrudedPolygon(bColorOnly ? OutColorWallData : OutWallData,
+                                LocalFootprint, 0.f, FoundationHeight, FoundationColor, false);
+
+                float EffBase, WallTop;
+                // In OSM, Height is ALWAYS the absolute height from ground level
+                // (for both building outlines and building:parts).
+                // MinHeight is the absolute height where the walls start (e.g. the
+                // base of a tower sitting on top of a podium).
+                // So: EffBase = max(MinH, FoundationHeight), WallTop = Height (absolute).
+                // For plain buildings (not parts) that carry no MinHeight, the old
+                // relative formula (EffBase + Height) was used — keep that for
+                // non-part buildings so single-outline buildings still look correct.
+                if (Building.bIsBuildingPart)
+                {
+                        // building:part — both Height and MinHeight are absolute from ground.
+                        // Use MinH as-is (even if 0) so the part starts at the right level.
+                        EffBase = (MinH > 10.f) ? MinH : FoundationHeight;
+                        WallTop = FMath::Max(BuildingH, EffBase + 10.f);
+                }
+                else
+                {
+                        // Plain building outline — Height is relative to ground.
+                        EffBase = FMath::Max(WallBase, FoundationHeight);
+                        WallTop = EffBase + BuildingH;
+                }
+
+                // When the roof height is EXPLICIT in OSM (roof:height / roof:levels),
+                // OSM's `height` is the absolute TOTAL including the roof. The walls
+                // must therefore stop at (top - roof:height) so the pitched/domed
+                // roof generated in GenerateRoofMeshes occupies the top RoofH instead
+                // of being stacked on top of full-height walls (which made the
+                // Frauenkirche nave read as 90 m instead of 60 m). This mirrors the
+                // WallTopZ computation in GenerateRoofMeshes exactly.
+                if ((Building.RoofHeight > 0.0) || (Building.RoofLevels > 0))
+                {
+                        float ExplicitRoofH = (Building.RoofHeight > 0.0)
+                                ? (float)(Building.RoofHeight * (double)ScaleFactor)
+                                : Building.RoofLevels * 300.f;
+                        // Match GenerateRoofMeshes for skillions: a shoulder touching an
+                        // onion/dome slopes down to the shared roofline so it attaches to
+                        // the dome; otherwise soften over-steep small skillions.
+                        if (Building.RoofShape == ERoofShape::Skillion)
+                        {
+                                float AttachEave = IsAdjacentToOnionDome(Building, Buildings)
+                                        ? DomeNestleEave(Building, Buildings, ScaleFactor, WallTop, EffBase) : -1.f;
+                                if (AttachEave > 0.f)
+                                        ExplicitRoofH = WallTop - AttachEave;
+                                else
+                                        ExplicitRoofH = GentleSkillionRise(LocalFootprint, (float)Building.RoofDirection, ExplicitRoofH);
+                        }
+                        WallTop = FMath::Max(EffBase + 10.f, WallTop - ExplicitRoofH);
+                }
+                else if (Building.RoofShape == ERoofShape::Round)
+                {
+                        // Mirror GenerateRoofMeshes: a barrel roof with no explicit
+                        // roof:height sits within the total height, so lower the walls by
+                        // the arch radius. Without this the walls would reach full height
+                        // and the semicircular roof would float above them.
+                        float Rise = ComputeBarrelRise(LocalFootprint, Building.RoofOrientation);
+                        if (Rise > 1.f)
+                                WallTop = FMath::Max(EffBase + 10.f, WallTop - Rise);
+                }
+
+                // Onion/dome turret: drop the column to the adjacent roofline (mirror of
+                // GenerateRoofMeshes) so the wall and the dome above it stay in sync.
+                if (Building.RoofShape == ERoofShape::Onion || Building.RoofShape == ERoofShape::Dome)
+                {
+                        float Eave = DomeNestleEave(Building, Buildings, ScaleFactor, WallTop, EffBase);
+                        if (Eave > 0.f)
+                                WallTop = Eave;
+                }
+
+                // Recompute level height based on actual wall extent
+                float ActualWallH = WallTop - EffBase;
+                if (ActualWallH > 1.f)
+                {
+                        NumLevels = FMath::Max(1, NumLevels);
+                        LevelH = ActualWallH / (float)NumLevels;
+                }
 
                 // Determine facade material from FacadeMaterialType
-                FMeshData& FacadeData = (Building.FacadeMaterialType == 1) ? OutBrickData
+                FMeshData& FacadeData = bColorOnly ? OutColorWallData
+                        : (Building.FacadeMaterialType == 1) ? OutBrickData
                         : (Building.FacadeMaterialType == 2) ? OutDarkStoneData
                         : (Building.FacadeMaterialType == 3) ? OutLightStoneData
                         : OutWallData;
-                FColor FacadeColor(255, 255, 255);
+                // Use the OSM building:colour (Building.WallColor) as the vertex
+                // colour for the whole facade, so the vertex-color material shows
+                // the real per-building colour (streets.gl style).
+                FColor FacadeColor = LinearToFColor(Building.WallColor);
 
-                // For tall buildings (>=21 levels): use glass material for upper portion
-                bool bTall = (NumLevels >= 21);
+                // Glass curtain-wall treatment is only appropriate for modern
+                // commercial high-rises. Gate it on building type so that tall
+                // HISTORIC towers (churches, cathedrals like the Frauenkirche,
+                // BuildingType 0/2/3) are NOT rendered as glass skyscrapers.
+                // (BuildingType: 0=residential, 1=commercial, 2=industrial, 3=other)
+                bool bTall = (NumLevels >= 21) && (Building.BuildingType == 1);
 
                 if (bTall)
                 {
@@ -1864,58 +4025,221 @@ void FGeoMeshGenerator::GenerateBuildingMeshes(
                 }
                 else
                 {
-                        AddExtrudedPolygon(FacadeData, LocalFootprint, EffBase, WallTop, FacadeColor, false);
+                        // ----------------------------------------------------------------
+                        // streets.gl-style wall + window system
+                        // ----------------------------------------------------------------
+                        // Key insight from streets.gl source (WallsBuilder.ts):
+                        //   - windowWidth = 4 m for ALL facade materials
+                        //   - windowCount = round(edgeLength / 4)
+                        //   - The ENTIRE wall face uses either textureIdWindow or textureIdWall
+                        //   - The window texture already contains both the window glass and
+                        //     the surrounding wall material — no separate window overlay needed
+                        //   - UV: U goes 0..windowCount (one texture repeat per slot),
+                        //         V goes 0..levels (one repeat per floor)
+                        //   - If buildingWindows=false: use wall texture instead of window texture
+                        // ----------------------------------------------------------------
+                        const bool bHasWindows = IsBuildingHasWindows(Building)
+                                && ((WallTop - EffBase) >= 200.f);
+                        const bool bSkillion = (Building.RoofShape == ERoofShape::Skillion);
 
-                        float FPMinX = FLT_MAX, FPMaxX = -FLT_MAX, FPMinY = FLT_MAX, FPMaxY = -FLT_MAX;
-                        ComputeFootprintBounds(LocalFootprint, FPMinX, FPMaxX, FPMinY, FPMaxY);
-                        float FootMin = FMath::Min(FPMaxX - FPMinX, FPMaxY - FPMinY);
-                        bool bNoWin = (FootMin < 500.f && BuildingH > 900.f)
-                                || (FootMin > 0.f && BuildingH / FootMin > 3.f);
-
-                        if (!bNoWin)
+                        if (bHasWindows)
                         {
-                                float WinH = LevelH * 0.5f;
-                                float WinVOff = LevelH * 0.25f;
+                                // Windowed buildings: per-edge wall quads with window texture.
+                                // The window texture (FacadePlasterWindow, FacadeBrickWindow, etc.)
+                                // already composites the window glass on the wall background.
+                                FWindowParams WP = GetWindowParams(
+                                        Building.BuildingType, NumLevels, BuildingH);
 
                                 TArray<FVector> WinFootprint = LocalFootprint;
                                 if (ComputeSignedArea2D(WinFootprint) < 0.f)
                                         Algo::Reverse(WinFootprint);
 
+                                // Skillion roofs: compute per-vertex top heights
+                                TArray<float> TopZ;
+                                if (bSkillion)
+                                {
+                                        float SkillionRoofH = (Building.RoofHeight > 0.0)
+                                                ? (float)(Building.RoofHeight * (double)ScaleFactor) : 0.f;
+                                        float SkillDir = (float)Building.RoofDirection;
+                                        float AttachEave = IsAdjacentToOnionDome(Building, Buildings)
+                                                ? DomeNestleEave(Building, Buildings, ScaleFactor, EffBase + BuildingH, EffBase) : -1.f;
+                                        if (AttachEave > 0.f)
+                                                SkillionRoofH = BuildingH - AttachEave;
+                                        else
+                                                SkillionRoofH = GentleSkillionRise(LocalFootprint, SkillDir, SkillionRoofH);
+
+                                        // Replicate AddSkillionExtrudedPolygon height calculation
+                                        TopZ.SetNum(WinFootprint.Num());
+                                        if (SkillDir >= 0.f)
+                                        {
+                                                float D_rad = FMath::DegreesToRadians(SkillDir);
+                                                FVector2D SlopeDir(-FMath::Sin(D_rad), FMath::Cos(D_rad));
+                                                float MinProj = FLT_MAX, MaxProj = -FLT_MAX;
+                                                for (const FVector& V : WinFootprint)
+                                                {
+                                                        float Proj = V.X * SlopeDir.X + V.Y * SlopeDir.Y;
+                                                        MinProj = FMath::Min(MinProj, Proj);
+                                                        MaxProj = FMath::Max(MaxProj, Proj);
+                                                }
+                                                float Range = FMath::Max(MaxProj - MinProj, 1.f);
+                                                for (int32 i = 0; i < WinFootprint.Num(); i++)
+                                                {
+                                                        float Proj = WinFootprint[i].X * SlopeDir.X + WinFootprint[i].Y * SlopeDir.Y;
+                                                        float T = (Proj - MinProj) / Range;
+                                                        TopZ[i] = WallTop + FMath::Lerp(0.f, SkillionRoofH, T);
+                                                }
+                                        }
+                                        else
+                                        {
+                                                for (int32 i = 0; i < WinFootprint.Num(); i++)
+                                                        TopZ[i] = WallTop;
+                                        }
+                                }
+
+                                // Emit per-edge wall quads with window UV mapping
                                 for (int32 i = 0; i < WinFootprint.Num(); i++)
                                 {
                                         int32 Next = (i + 1) % WinFootprint.Num();
                                         FVector P0(WinFootprint[i].X, WinFootprint[i].Y, 0.f);
                                         FVector P1(WinFootprint[Next].X, WinFootprint[Next].Y, 0.f);
-                                        FVector ED = P1 - P0; float EL = ED.Size2D(); if (EL < 1.f) continue; ED.Normalize();
-                                        FVector OutN(ED.Y, -ED.X, 0.f);
-                                        if (EL < MinEdgeForWindows) continue;
-                                        float Margin = EL * WindowMarginRatio;
-                                        float Avail = EL - 2.f * Margin;
-                                        int32 WPF = FMath::Max(2, FMath::FloorToInt(Avail / WindowSpacingCm));
-                                        for (int32 Lv = 0; Lv < NumLevels; Lv++)
+                                        FVector ED = P1 - P0; float EL = ED.Size2D(); if (EL < 1.f) continue;
+
+                                        // Window count for this edge (streets.gl: round(length / windowWidth))
+                                        float EdgeLengthM = EL / 100.f;
+                                        float WindowSlotM = WP.WindowSlotWidth / 100.f;
+                                        int32 WindowCount = FMath::Max(1, FMath::RoundToInt(EdgeLengthM / WindowSlotM));
+
+                                        // UV mapping (streets.gl style):
+                                        // U: 0 → WindowCount (one window texture repeat per slot)
+                                        // V: 0 → NumLevels (one floor texture repeat per level)
+                                        float U0 = 0.f, U1 = (float)WindowCount;
+                                        float VBot = 0.f, VTop = (float)NumLevels;
+
+                                        if (bSkillion)
                                         {
-                                                if (Lv == NumLevels - 1) continue;
-                                                int32 NW = (Lv == 0 && NumLevels > 2) ? FMath::Max(1, WPF - 1) : WPF;
-                                                float SlotW = Avail / (float)NW;
-                                                float WW = FMath::Clamp(SlotW * 0.55f, 60.f, 150.f);
-                                                float FB = EffBase + Lv * LevelH;
-                                                float WB = FB + WinVOff, WT = WB + WinH;
-                                                for (int32 w = 0; w < NW; w++)
+                                                // Per-vertex top heights for skillion
+                                                FVector BL(P0.X, P0.Y, EffBase);
+                                                FVector BR(P1.X, P1.Y, EffBase);
+                                                FVector TR(P1.X, P1.Y, TopZ[Next]);
+                                                FVector TL(P0.X, P0.Y, TopZ[i]);
+                                                // For skillion, V varies per vertex based on height
+                                                float V0i = (TopZ[i] - EffBase) / (WallTop - EffBase) * (float)NumLevels;
+                                                float V0n = (TopZ[Next] - EffBase) / (WallTop - EffBase) * (float)NumLevels;
+                                                // Custom UV with per-vertex V
+                                                int32 BI = OutWindowData.Vertices.Num();
+                                                OutWindowData.Vertices.Add(BL); OutWindowData.Vertices.Add(BR);
+                                                OutWindowData.Vertices.Add(TR); OutWindowData.Vertices.Add(TL);
+                                                OutWindowData.Triangles.Add(BI + 0); OutWindowData.Triangles.Add(BI + 2); OutWindowData.Triangles.Add(BI + 1);
+                                                OutWindowData.Triangles.Add(BI + 0); OutWindowData.Triangles.Add(BI + 3); OutWindowData.Triangles.Add(BI + 2);
+                                                ED.Normalize();
+                                                FVector OutN(ED.Y, -ED.X, 0.f);
+                                                FVector Tang = ED; if (!Tang.IsNearlyZero()) Tang.Normalize(); else Tang = FVector(1, 0, 0);
+                                                OutWindowData.UV0.Add(FVector2D(U0, VBot)); OutWindowData.UV0.Add(FVector2D(U1, VBot));
+                                                OutWindowData.UV0.Add(FVector2D(U1, V0n)); OutWindowData.UV0.Add(FVector2D(U0, V0i));
+                                                for (int32 v = 0; v < 4; v++)
                                                 {
-                                                        float CT = Margin + SlotW * ((float)w + 0.5f);
-                                                        FVector WC = P0 + ED * CT + OutN * WindowOutset;
-                                                        float HW = WW * 0.5f;
-                                                        FVector WBL = WC - ED * HW; WBL.Z = WB;
-                                                        FVector WBR = WC + ED * HW; WBR.Z = WB;
-                                                        FVector WTL = WBL; WTL.Z = WT;
-                                                        FVector WTR = WBR; WTR.Z = WT;
-                                                        AddQuad(OutGlassData, WBL, WBR, WTR, WTL, GlassColor);
+                                                        OutWindowData.Normals.Add(OutN);
+                                                        OutWindowData.VertexColors.Add(FacadeColor);
+                                                        OutWindowData.Tangents.Add(FProcMeshTangent(Tang, false));
                                                 }
+                                        }
+                                        else
+                                        {
+                                                FVector BL(P0.X, P0.Y, EffBase);
+                                                FVector BR(P1.X, P1.Y, EffBase);
+                                                FVector TR(P1.X, P1.Y, WallTop);
+                                                FVector TL(P0.X, P0.Y, WallTop);
+                                                AddOutwardWallQuad(OutWindowData, BL, BR, TR, TL, FacadeColor,
+                                                        U0, U1, VBot, VTop);
+                                        }
+                                }
+
+                                // Inner courtyard walls (holes) with window texture
+                                for (const TArray<FVector2D>& Hole : Building.Holes)
+                                {
+                                        if (Hole.Num() < 3) continue;
+                                        TArray<FVector> HoleFP;
+                                        HoleFP.Reserve(Hole.Num());
+                                        for (const FVector2D& H : Hole)
+                                                HoleFP.Add(FVector(H.X * ScaleFactor, -H.Y * ScaleFactor, 0.f));
+                                        // Reverse hole footprint so normals face inward
+                                        if (ComputeSignedArea2D(HoleFP) > 0.f)
+                                                Algo::Reverse(HoleFP);
+                                        for (int32 i = 0; i < HoleFP.Num(); i++)
+                                        {
+                                                int32 Next = (i + 1) % HoleFP.Num();
+                                                FVector P0(HoleFP[i].X, HoleFP[i].Y, 0.f);
+                                                FVector P1(HoleFP[Next].X, HoleFP[Next].Y, 0.f);
+                                                float EL = FVector2D::Distance(FVector2D(P0.X, P0.Y), FVector2D(P1.X, P1.Y));
+                                                if (EL < 1.f) continue;
+                                                float EdgeLengthM = EL / 100.f;
+                                                float WindowSlotM = WP.WindowSlotWidth / 100.f;
+                                                int32 WindowCount = FMath::Max(1, FMath::RoundToInt(EdgeLengthM / WindowSlotM));
+                                                FVector BL(P0.X, P0.Y, EffBase);
+                                                FVector BR(P1.X, P1.Y, EffBase);
+                                                FVector TR(P1.X, P1.Y, WallTop);
+                                                FVector TL(P0.X, P0.Y, WallTop);
+                                                AddOutwardWallQuad(OutWindowData, BL, BR, TR, TL, FacadeColor,
+                                                        0.f, (float)WindowCount, 0.f, (float)NumLevels);
                                         }
                                 }
                         }
+                        else
+                        {
+                                // Non-windowed buildings: simple extruded polygon with wall texture
+                                // (garages, greenhouses, silos, churches, towers, etc.)
+                                if (bSkillion)
+                                {
+                                        float SkillionRoofH = (Building.RoofHeight > 0.0)
+                                                ? (float)(Building.RoofHeight * (double)ScaleFactor) : 0.f;
+                                        float SkillDir = (float)Building.RoofDirection;
+                                        float AttachEave = IsAdjacentToOnionDome(Building, Buildings)
+                                                ? DomeNestleEave(Building, Buildings, ScaleFactor, EffBase + BuildingH, EffBase) : -1.f;
+                                        if (AttachEave > 0.f)
+                                                SkillionRoofH = BuildingH - AttachEave;
+                                        else
+                                                SkillionRoofH = GentleSkillionRise(LocalFootprint, SkillDir, SkillionRoofH);
+                                        AddSkillionExtrudedPolygon(FacadeData, LocalFootprint,
+                                                EffBase, WallTop, SkillionRoofH, SkillDir, FacadeColor);
+                                }
+                                else
+                                {
+                                        AddExtrudedPolygon(FacadeData, LocalFootprint, EffBase, WallTop, FacadeColor, false);
+                                }
+
+                                // Inner courtyard walls
+                                for (const TArray<FVector2D>& Hole : Building.Holes)
+                                {
+                                        if (Hole.Num() < 3) continue;
+                                        TArray<FVector> HoleFP;
+                                        HoleFP.Reserve(Hole.Num());
+                                        for (const FVector2D& H : Hole)
+                                                HoleFP.Add(FVector(H.X * ScaleFactor, -H.Y * ScaleFactor, 0.f));
+                                        AddExtrudedPolygon(FacadeData, HoleFP, EffBase, WallTop, FacadeColor, false);
+                                }
+                        }
                 }
+
+                // Stamp the chosen facade atlas slice into UV1 for this building.
+                // WallSlice  → solid wall panel  (FacadeBrickWall, FacadePlasterWall, …)
+                // WindowSlice→ window cut-out panel that matches the wall material
+                //              (FacadeBrickWindow, FacadePlasterWindow, …)
+                // FacadeGlass→ full glass-curtain panel for tall commercial towers
+                const float WallSlice   = FacadeWallSlice(Building.FacadeMaterialType);
+                const float WindowSlice = FacadeWindowSlice(Building.FacadeMaterialType);
+                FillSliceUV1(OutWallData,       UV1_Wall,   WallSlice);
+                FillSliceUV1(OutBrickData,      UV1_Brick,  WallSlice);
+                FillSliceUV1(OutDarkStoneData,  UV1_Dark,   WallSlice);
+                FillSliceUV1(OutLightStoneData, UV1_Light,  WallSlice);
+                FillSliceUV1(OutColorWallData,  UV1_Color,  WallSlice);
+                FillSliceUV1(OutGlassData,      UV1_Glass,  (float)TokhdoruAtlas::FacadeGlass);
+                FillSliceUV1(OutWindowData,     UV1_Window, WindowSlice);
+                FillSliceUV1(OutWindowFrameData,UV1_Frame,  WallSlice);    // frame uses wall texture
+                FillSliceUV1(OutWindowGlassData,UV1_WGlass, (float)TokhdoruAtlas::FacadeGlass); // glass pane
         }
+        // NOTE: glass normals are already baked outward by AddOutwardWallQuad and
+        // AddExtrudedPolygon. Do NOT run RecomputeNormals here — it flips face
+        // normals (it exists for roofs) and would light the glass from the inside.
 }
 
 // ============================================================================
@@ -1926,40 +4250,213 @@ void FGeoMeshGenerator::GenerateRoadMeshes(
         FMeshData& OutRoadData, FMeshData& OutSidewalkData)
 {
         OutRoadData.Reset(); OutSidewalkData.Reset();
-        FColor RoadColor(60, 60, 60), SidewalkColor(180, 175, 170);
-        const float SidewalkWidth = 150.f, CurbHeight = 15.f, SidewalkZOffset = 10.f;
+        const FColor RoadColor(60, 60, 60), SidewalkColor(180, 175, 170);
+        const float SidewalkWidth = 150.f;
+        // Layer the surfaces at distinct, small heights above the ground so the
+        // road, sidewalk and curb never sit coplanar with the ground or with
+        // each other (the old coplanar stack at Z~0 caused the z-fighting
+        // "messy lines"). Mirrors how streets.gl draws roads as a flat ribbon
+        // just above terrain.
+        const float SidewalkZ = 12.f;   // sidewalk top
+        const float RoadZ     = 4.f;    // road surface
+        const float CurbZ     = SidewalkZ; // curb rises from road to sidewalk
+
+        // Emit a flat road quad with proper along/across UVs (U across the width
+        // 0..1, V along the length) and a texture-atlas slice in UV1.x. Normals
+        // are recomputed afterwards, tangent runs along the road.
+        auto AddRoadQuad = [](FMeshData& MD,
+                const FVector& V0, const FVector& V1, const FVector& V2, const FVector& V3,
+                const FColor& Col,
+                const FVector2D& T0, const FVector2D& T1, const FVector2D& T2, const FVector2D& T3,
+                float Slice)
+        {
+                const int32 BI = MD.Vertices.Num();
+                MD.Vertices.Add(V0); MD.Vertices.Add(V1); MD.Vertices.Add(V2); MD.Vertices.Add(V3);
+                MD.Triangles.Add(BI + 0); MD.Triangles.Add(BI + 1); MD.Triangles.Add(BI + 2);
+                MD.Triangles.Add(BI + 0); MD.Triangles.Add(BI + 2); MD.Triangles.Add(BI + 3);
+                FVector Tang = (V3 - V0).GetSafeNormal();
+                if (Tang.IsNearlyZero()) Tang = FVector(1, 0, 0);
+                MD.UV0.Add(T0); MD.UV0.Add(T1); MD.UV0.Add(T2); MD.UV0.Add(T3);
+                for (int32 k = 0; k < 4; k++)
+                {
+                        MD.Normals.Add(FVector(0, 0, 1));
+                        MD.VertexColors.Add(Col);
+                        MD.Tangents.Add(FProcMeshTangent(Tang, false));
+                        MD.UV1.Add(FVector2D(Slice, 0.f));
+                }
+        };
+
+        // Fill a road junction / end with a flat octagonal asphalt cap so the
+        // overlapping road ribbons at intersections read as a single filled
+        // surface (mirrors how streets.gl fills junction polygons). Caps use the
+        // unmarked-asphalt slice (1) so no lane markings cross the intersection,
+        // and sit a hair above the ribbons to hide the coplanar overlap.
+        auto AddJunctionCap = [](FMeshData& MD, const FVector2D& C, float R, float Z,
+                const FColor& Col)
+        {
+                const int32 Seg = 8;
+                const float Slice = 1.f; // unmarked asphalt
+                const int32 CI = MD.Vertices.Num();
+                auto PushV = [&](const FVector2D& P, const FVector2D& UV)
+                {
+                        MD.Vertices.Add(FVector(P.X, P.Y, Z));
+                        MD.Normals.Add(FVector(0, 0, 1));
+                        MD.VertexColors.Add(Col);
+                        MD.Tangents.Add(FProcMeshTangent(FVector(1, 0, 0), false));
+                        MD.UV0.Add(UV);
+                        MD.UV1.Add(FVector2D(Slice, 0.f));
+                };
+                PushV(C, FVector2D(0.5f, 0.5f));
+                for (int32 s = 0; s <= Seg; s++)
+                {
+                        const float A = (2.f * PI * s) / Seg;
+                        const FVector2D Dir(FMath::Cos(A), FMath::Sin(A));
+                        PushV(C + Dir * R, FVector2D(0.5f + Dir.X * 0.5f, 0.5f + Dir.Y * 0.5f));
+                }
+                // Same CCW winding (in XY) as the road ribbon quads, so the caps end
+                // up with the identical face normal and shade exactly like the road.
+                for (int32 s = 0; s < Seg; s++)
+                {
+                        MD.Triangles.Add(CI);
+                        MD.Triangles.Add(CI + 1 + s);
+                        MD.Triangles.Add(CI + 1 + s + 1);
+                }
+        };
 
         for (const FGeoRoad& Road : Roads)
         {
-                if (Road.Points.Num() < 2) continue;
-                float RW = Road.Width > 0.f ? Road.Width * ScaleFactor : 600.f;
-                float HW = RW * 0.5f, OH = HW + SidewalkWidth;
+                const int32 N = Road.Points.Num();
+                if (N < 2) continue;
 
-                TArray<FVector> RL, RR, SL, SR;
-                for (int32 i = 0; i < Road.Points.Num(); i++)
+                const float RW = Road.Width > 0.f ? Road.Width * ScaleFactor : 600.f;
+                const float HW = RW * 0.5f;          // half road width
+                const float OH = HW + SidewalkWidth; // outer (sidewalk) half width
+
+                // Pedestrian ways (footway/path/cycleway/steps/pedestrian/...) are not
+                // vehicle roads: no flanking sidewalk, drawn as pavement, and laid a
+                // bit LOWER than vehicle roads so a footway crossing a road is covered
+                // by the road instead of cutting a light strip across the asphalt.
+                const FString HWType = Road.RoadTypeStr.ToLower();
+                const bool bVehicleRoad = !(
+                        HWType == TEXT("footway")   || HWType == TEXT("path")    ||
+                        HWType == TEXT("cycleway")  || HWType == TEXT("steps")   ||
+                        HWType == TEXT("pedestrian")|| HWType == TEXT("track")   ||
+                        HWType == TEXT("bridleway") || HWType == TEXT("corridor")||
+                        HWType == TEXT("platform")  || HWType == TEXT("construction") ||
+                        HWType == TEXT("proposed")  || HWType.IsEmpty());
+                const float SurfZ = bVehicleRoad ? RoadZ : (RoadZ - 2.5f);
+
+                // Pre-convert points to UE 2D space.
+                TArray<FVector2D> Pts;
+                Pts.Reserve(N);
+                for (int32 i = 0; i < N; i++)
+                        Pts.Add(FVector2D(Road.Points[i].X * ScaleFactor, -Road.Points[i].Y * ScaleFactor));
+
+                // Per-vertex MITERED normal: the offset direction at each vertex is
+                // the bisector of the incoming and outgoing edge normals, scaled by
+                // 1/cos(theta/2) so the constant-width ribbon stays parallel-sided
+                // through bends instead of pinching/twisting.
+                TArray<FVector2D> Miter;
+                Miter.SetNum(N);
+                auto EdgeNormal = [](const FVector2D& A, const FVector2D& B) -> FVector2D
                 {
-                        float X = Road.Points[i].X * ScaleFactor, Y = Road.Points[i].Y * ScaleFactor;
-                        FVector Dir(0, 0, 0);
-                        if (i < Road.Points.Num() - 1) { FVector N(Road.Points[i + 1].X * ScaleFactor, Road.Points[i + 1].Y * ScaleFactor, 0); Dir = (N - FVector(X, Y, 0)).GetSafeNormal(); }
-                        if (i > 0 && Dir.IsNearlyZero()) { FVector P(Road.Points[i - 1].X * ScaleFactor, Road.Points[i - 1].Y * ScaleFactor, 0); Dir = (FVector(X, Y, 0) - P).GetSafeNormal(); }
-                        if (Dir.IsNearlyZero()) Dir = FVector(1, 0, 0);
-                        FVector Perp(Dir.Y, -Dir.X, 0);
-                        RL.Add(FVector(X, Y, 0) + Perp * HW); RR.Add(FVector(X, Y, 0) - Perp * HW);
-                        SL.Add(FVector(X, Y, 0) + Perp * OH); SR.Add(FVector(X, Y, 0) - Perp * OH);
+                        FVector2D D = (B - A).GetSafeNormal();
+                        return FVector2D(D.Y, -D.X); // right-hand perpendicular
+                };
+                for (int32 i = 0; i < N; i++)
+                {
+                        FVector2D nIn  = (i > 0)     ? EdgeNormal(Pts[i - 1], Pts[i]) : FVector2D::ZeroVector;
+                        FVector2D nOut = (i < N - 1) ? EdgeNormal(Pts[i], Pts[i + 1]) : FVector2D::ZeroVector;
+                        FVector2D m;
+                        if (nIn.IsNearlyZero())      m = nOut;
+                        else if (nOut.IsNearlyZero()) m = nIn;
+                        else
+                        {
+                                m = (nIn + nOut).GetSafeNormal();
+                                const float c = FVector2D::DotProduct(m, nOut);
+                                // Clamp the miter scale so near-180-degree hairpins don't explode.
+                                const float scale = (FMath::Abs(c) > 0.2f) ? (1.f / c) : 5.f;
+                                m *= scale;
+                        }
+                        if (m.IsNearlyZero()) m = FVector2D(1, 0);
+                        Miter[i] = m;
                 }
-                for (int32 i = 0; i < Road.Points.Num() - 1; i++)
+
+                // Build offset rails.
+                TArray<FVector> RL, RR, SL, SR;
+                RL.SetNum(N); RR.SetNum(N); SL.SetNum(N); SR.SetNum(N);
+                for (int32 i = 0; i < N; i++)
                 {
-                        AddQuad(OutRoadData, RL[i], RR[i], RR[i + 1], RL[i + 1], RoadColor);
-                        AddQuad(OutSidewalkData, SL[i], RL[i], RL[i + 1], SL[i + 1], SidewalkColor);
-                        AddQuad(OutSidewalkData, FVector(RL[i].X, RL[i].Y, 0), FVector(RL[i + 1].X, RL[i + 1].Y, 0), FVector(RL[i + 1].X, RL[i + 1].Y, CurbHeight), FVector(RL[i].X, RL[i].Y, CurbHeight), SidewalkColor);
-                        AddQuad(OutSidewalkData, FVector(SL[i].X, SL[i].Y, SidewalkZOffset), FVector(RL[i].X, RL[i].Y, SidewalkZOffset), FVector(RL[i + 1].X, RL[i + 1].Y, SidewalkZOffset), FVector(SL[i + 1].X, SL[i + 1].Y, SidewalkZOffset), SidewalkColor);
-                        AddQuad(OutSidewalkData, RR[i], SR[i], SR[i + 1], RR[i + 1], SidewalkColor);
-                        AddQuad(OutSidewalkData, FVector(RR[i].X, RR[i].Y, 0), FVector(RR[i + 1].X, RR[i + 1].Y, 0), FVector(RR[i + 1].X, RR[i + 1].Y, CurbHeight), FVector(RR[i].X, RR[i].Y, CurbHeight), SidewalkColor);
-                        AddQuad(OutSidewalkData, FVector(RR[i].X, RR[i].Y, SidewalkZOffset), FVector(SR[i].X, SR[i].Y, SidewalkZOffset), FVector(SR[i + 1].X, SR[i + 1].Y, SidewalkZOffset), FVector(RR[i + 1].X, RR[i + 1].Y, SidewalkZOffset), SidewalkColor);
+                        const FVector2D P = Pts[i];
+                        const FVector2D M = Miter[i];
+                        RL[i] = FVector(P + M * HW, SurfZ);
+                        RR[i] = FVector(P - M * HW, SurfZ);
+                        SL[i] = FVector(P + M * OH, SidewalkZ);
+                        SR[i] = FVector(P - M * OH, SidewalkZ);
+                }
+
+                // Cumulative V along the road. Use a FIXED real-world tile length
+                // (~12 m) instead of one-tile-per-road-width, so lane markings keep a
+                // consistent, less-dense scale on every road regardless of width.
+                const float RoadTileLen = 1200.f; // 12 m per texture tile
+                TArray<float> VAlong; VAlong.SetNum(N); VAlong[0] = 0.f;
+                for (int32 i = 1; i < N; i++)
+                        VAlong[i] = VAlong[i - 1] + FVector2D::Distance(Pts[i - 1], Pts[i]) / RoadTileLen;
+
+                // Texture slice: 0 = marked road (primary/secondary/tertiary/highway),
+                // 1 = unmarked road (residential/service/...), 2 = pavement (footways).
+                const bool bMarked = Road.bIsHighway ||
+                        Road.RoadType == 1 || Road.RoadType == 2 || Road.RoadType == 3;
+                const float RoadSlice = !bVehicleRoad ? 2.f : (bMarked ? 0.f : 1.f);
+
+                for (int32 i = 0; i < N - 1; i++)
+                {
+                        // Road surface (CCW seen from above so the up-normal is correct).
+                        // U: 0 at the right rail, 1 at the left rail; V: along the length.
+                        AddRoadQuad(OutRoadData, RR[i], RL[i], RL[i + 1], RR[i + 1], RoadColor,
+                                FVector2D(0.f, VAlong[i]), FVector2D(1.f, VAlong[i]),
+                                FVector2D(1.f, VAlong[i + 1]), FVector2D(0.f, VAlong[i + 1]),
+                                RoadSlice);
+
+                        if (bVehicleRoad)
+                        {
+                                // Left sidewalk top.
+                                AddQuad(OutSidewalkData, RL[i], SL[i], SL[i + 1], RL[i + 1], SidewalkColor);
+                                // Left curb riser (road edge up to sidewalk top).
+                                AddQuad(OutSidewalkData,
+                                        FVector(RL[i].X, RL[i].Y, RoadZ),
+                                        FVector(RL[i].X, RL[i].Y, CurbZ),
+                                        FVector(RL[i + 1].X, RL[i + 1].Y, CurbZ),
+                                        FVector(RL[i + 1].X, RL[i + 1].Y, RoadZ),
+                                        SidewalkColor);
+
+                                // Right sidewalk top.
+                                AddQuad(OutSidewalkData, SR[i], RR[i], RR[i + 1], SR[i + 1], SidewalkColor);
+                                // Right curb riser.
+                                AddQuad(OutSidewalkData,
+                                        FVector(RR[i].X, RR[i].Y, CurbZ),
+                                        FVector(RR[i].X, RR[i].Y, RoadZ),
+                                        FVector(RR[i + 1].X, RR[i + 1].Y, RoadZ),
+                                        FVector(RR[i + 1].X, RR[i + 1].Y, CurbZ),
+                                        SidewalkColor);
+                        }
+                }
+
+                // Octagonal asphalt caps at both ends fill junctions/corners so the
+                // overlapping ribbons at intersections read as one filled surface.
+                if (bVehicleRoad && N >= 2)
+                {
+                        AddJunctionCap(OutRoadData, Pts[0],     HW, RoadZ + 0.5f, RoadColor);
+                        AddJunctionCap(OutRoadData, Pts[N - 1], HW, RoadZ + 0.5f, RoadColor);
                 }
         }
-        FlipNormals(OutRoadData);
-        FlipNormals(OutSidewalkData);
+        // Normals already point up from the CCW winding above; recompute cleanly
+        // instead of blindly flipping (the old FlipNormals inverted the ribbon).
+        // Sidewalks are all pavement -> surface-atlas slice 2.
+        FillSliceUV1(OutSidewalkData, 0, 2.f);
+
+        RecomputeNormals(OutRoadData);
+        RecomputeNormals(OutSidewalkData);
 }
 
 // ============================================================================
@@ -1974,7 +4471,7 @@ void FGeoMeshGenerator::GenerateWaterMeshes(const TArray<FGeoWater>& WaterBodies
                 if (Water.Points.Num() < 3) continue;
                 TArray<FVector> LP;
                 for (const FVector2D& P : Water.Points)
-                        LP.Add(FVector(P.X * ScaleFactor, P.Y * ScaleFactor, 0.f));
+                        LP.Add(FVector(P.X * ScaleFactor, -P.Y * ScaleFactor, 0.f));
                 AddPolygonTriangulated(OutWaterData, LP, 0.f, WC);
         }
 }
@@ -1985,31 +4482,326 @@ void FGeoMeshGenerator::GenerateWaterMeshes(const TArray<FGeoWater>& WaterBodies
 void FGeoMeshGenerator::GenerateGroundMesh(
         const TArray<FGeoBuilding>& Buildings, const TArray<FGeoRoad>& Roads,
         const TArray<FGeoWater>& WaterBodies, const TArray<FGeoVegetation>& Vegetations,
-        FMeshData& OutGroundData, float GroundOffset)
+        const TArray<FElevationSample>& ElevationSamples,
+        FMeshData& OutGroundData, float GroundOffset,
+        bool bUseTerrainElevation, int32 TerrainGridSubdivisions)
 {
         OutGroundData.Reset();
         float MinX, MaxX, MinY, MaxY;
         ComputeDataBounds(Buildings, Roads, WaterBodies, Vegetations, MinX, MaxX, MinY, MaxY);
         if (MinX >= MaxX || MinY >= MaxY) { MinX = -5000.f; MaxX = 5000.f; MinY = -5000.f; MaxY = 5000.f; }
+
         float Pad = 5000.f;
         float UMinX = MinX * ScaleFactor - Pad, UMaxX = MaxX * ScaleFactor + Pad;
+        // ---------------------------------------------------------------------------
+        // Y-axis mirror fix:
+        // Every other generator (buildings line ~3863, roads line ~4353, railways
+        // line ~4648, OSM trees line ~4785) uses UE_Y = -LocalY * ScaleFactor.
+        // ComputeDataBounds() returns raw local-meter Y (Min/MaxY), so the UE-Y
+        // range must be mirrored AND swapped: UE_Y_max corresponds to local Y_min
+        // and vice-versa. Without this, the ground plane lands in +Y while every
+        // building sits in -Y, producing the visible "ground floating to one side
+        // and shifted" defect.
+        // ---------------------------------------------------------------------------
         float UMinY = MinY * ScaleFactor - Pad, UMaxY = MaxY * ScaleFactor + Pad;
-        float Z = GroundOffset - 5.f;
 
-        AddQuad(OutGroundData,
-                FVector(UMinX, UMinY, Z),
-                FVector(UMaxX, UMinY, Z),
-                FVector(UMaxX, UMaxY, Z),
-                FVector(UMinX, UMaxY, Z),
-                FColor(80, 140, 60));
+        const bool bDeformTerrain = bUseTerrainElevation && ElevationSamples.Num() >= 3;
+        double RefElev = 0.0;
+        if (bDeformTerrain)
+        {
+                RefElev = ElevationSamples[0].Elevation;
+                for (const FElevationSample& S : ElevationSamples)
+                        RefElev = FMath::Min(RefElev, S.Elevation);
+        }
 
-        int32 US = OutGroundData.UV0.Num() - 4;
-        float TX = (UMaxX - UMinX) / 1000.f, TY = (UMaxY - UMinY) / 1000.f;
-        OutGroundData.UV0[US + 0] = FVector2D(0, 0);
-        OutGroundData.UV0[US + 1] = FVector2D(TX, 0);
-        OutGroundData.UV0[US + 2] = FVector2D(TX, TY);
-        OutGroundData.UV0[US + 3] = FVector2D(0, TY);
-        FlipNormals(OutGroundData);
+        auto SampleElevUE = [&](float LocalXM, float LocalYM) -> float
+        {
+                if (!bDeformTerrain) return GroundOffset - 5.f;
+
+                float WeightSum = 0.f, ElevSum = 0.f;
+                const float Power = 2.f;
+                const float MinDistM = 0.5f;
+                for (const FElevationSample& S : ElevationSamples)
+                {
+                        const float DX = LocalXM - S.Location.X;
+                        const float DY = LocalYM - S.Location.Y;
+                        const float Dist = FMath::Sqrt(DX * DX + DY * DY);
+                        if (Dist < MinDistM)
+                                return (float)((S.Elevation - RefElev) * (double)ScaleFactor) + GroundOffset - 5.f;
+                        const float W = 1.f / FMath::Pow(Dist, Power);
+                        ElevSum += W * (float)(S.Elevation - RefElev);
+                        WeightSum += W;
+                }
+                const float ElevM = WeightSum > 0.f ? (ElevSum / WeightSum) : 0.f;
+                return ElevM * ScaleFactor + GroundOffset - 5.f;
+        };
+
+        if (!bDeformTerrain)
+        {
+                const float Z = GroundOffset - 5.f;
+                AddQuad(OutGroundData,
+                        FVector(UMinX, UMinY, Z),
+                        FVector(UMaxX, UMinY, Z),
+                        FVector(UMaxX, UMaxY, Z),
+                        FVector(UMinX, UMaxY, Z),
+                        FColor(146, 143, 138));
+
+                const int32 US = OutGroundData.UV0.Num() - 4;
+                const float TX = (UMaxX - UMinX) / 1000.f, TY = (UMaxY - UMinY) / 1000.f;
+                OutGroundData.UV0[US + 0] = FVector2D(0, 0);
+                OutGroundData.UV0[US + 1] = FVector2D(TX, 0);
+                OutGroundData.UV0[US + 2] = FVector2D(TX, TY);
+                OutGroundData.UV0[US + 3] = FVector2D(0, TY);
+                FillSliceUV1(OutGroundData, 0, 2.f);
+                FlipNormals(OutGroundData);
+                return;
+        }
+
+        const int32 NX = FMath::Clamp(TerrainGridSubdivisions, 8, 256);
+        const int32 NY = NX;
+        const float StepX = (UMaxX - UMinX) / NX;
+        const float StepY = (UMaxY - UMinY) / NY;
+
+        auto GridZ = [&](int32 Ix, int32 Iy) -> float
+        {
+                const float UX = UMinX + StepX * Ix;
+                const float UY = UMinY + StepY * Iy;
+                const float LocalXM = UX / ScaleFactor;
+                const float LocalYM = -UY / ScaleFactor;
+                return SampleElevUE(LocalXM, LocalYM);
+        };
+
+        for (int32 Iy = 0; Iy < NY; Iy++)
+        {
+                for (int32 Ix = 0; Ix < NX; Ix++)
+                {
+                        const float X0 = UMinX + StepX * Ix;
+                        const float X1 = UMinX + StepX * (Ix + 1);
+                        const float Y0 = UMinY + StepY * Iy;
+                        const float Y1 = UMinY + StepY * (Iy + 1);
+
+                        const float Z00 = GridZ(Ix, Iy);
+                        const float Z10 = GridZ(Ix + 1, Iy);
+                        const float Z11 = GridZ(Ix + 1, Iy + 1);
+                        const float Z01 = GridZ(Ix, Iy + 1);
+
+                        AddTriangle(OutGroundData,
+                                FVector(X0, Y0, Z00), FVector(X1, Y0, Z10), FVector(X1, Y1, Z11),
+                                FColor(146, 143, 138));
+                        AddTriangle(OutGroundData,
+                                FVector(X0, Y0, Z00), FVector(X1, Y1, Z11), FVector(X0, Y1, Z01),
+                                FColor(146, 143, 138));
+                }
+        }
+
+        const float TX = (UMaxX - UMinX) / 1000.f, TY = (UMaxY - UMinY) / 1000.f;
+        for (int32 i = 0; i < OutGroundData.UV0.Num(); i++)
+        {
+                const FVector& V = OutGroundData.Vertices[i];
+                OutGroundData.UV0[i] = FVector2D(
+                        (V.X - UMinX) / FMath::Max(UMaxX - UMinX, 1.f) * TX,
+                        (V.Y - UMinY) / FMath::Max(UMaxY - UMinY, 1.f) * TY);
+        }
+        FillSliceUV1(OutGroundData, 0, 2.f);
+        RecomputeNormals(OutGroundData);
+}
+
+// ============================================================================
+// GenerateRailwayMeshes — ballast bed + twin rails (streets.gl railway parity)
+// ============================================================================
+void FGeoMeshGenerator::GenerateRailwayMeshes(
+        const TArray<FGeoRailway>& Railways,
+        FMeshData& OutBallastData,
+        FMeshData& OutRailData)
+{
+        OutBallastData.Reset();
+        OutRailData.Reset();
+
+        const FColor BallastColor(95, 88, 78);
+        const FColor RailColor(45, 45, 48);
+        const float BallastZ = 2.5f;
+        const float RailZ = 5.f;
+
+        auto AddRailQuad = [](FMeshData& MD,
+                const FVector& V0, const FVector& V1, const FVector& V2, const FVector& V3,
+                const FColor& Col, float Slice)
+        {
+                const int32 BI = MD.Vertices.Num();
+                MD.Vertices.Add(V0); MD.Vertices.Add(V1); MD.Vertices.Add(V2); MD.Vertices.Add(V3);
+                MD.Triangles.Add(BI + 0); MD.Triangles.Add(BI + 1); MD.Triangles.Add(BI + 2);
+                MD.Triangles.Add(BI + 0); MD.Triangles.Add(BI + 2); MD.Triangles.Add(BI + 3);
+                const FVector Tang = (V3 - V0).GetSafeNormal();
+                for (int32 k = 0; k < 4; k++)
+                {
+                        MD.Normals.Add(FVector(0, 0, 1));
+                        MD.VertexColors.Add(Col);
+                        MD.Tangents.Add(FProcMeshTangent(Tang.IsNearlyZero() ? FVector(1, 0, 0) : Tang, false));
+                        MD.UV0.Add(FVector2D((k == 1 || k == 2) ? 1.f : 0.f, (k >= 2) ? 1.f : 0.f));
+                        MD.UV1.Add(FVector2D(Slice, 0.f));
+                }
+        };
+
+        for (const FGeoRailway& Railway : Railways)
+        {
+                const int32 N = Railway.Points.Num();
+                if (N < 2) continue;
+
+                const int32 Tracks = FMath::Max(1, Railway.Tracks);
+                const float GaugeM = Railway.Gauge > 0.f ? Railway.Gauge : 1435.f;
+                const float GaugeUE = (GaugeM / 1000.f) * ScaleFactor;
+                const float BallastHalfW = FMath::Max(250.f, GaugeUE * 0.55f + 120.f * Tracks);
+                const float RailHalfW = 8.f;
+
+                TArray<FVector2D> Pts;
+                Pts.Reserve(N);
+                for (int32 i = 0; i < N; i++)
+                        Pts.Add(FVector2D(Railway.Points[i].X * ScaleFactor, -Railway.Points[i].Y * ScaleFactor));
+
+                TArray<FVector2D> Miter;
+                Miter.SetNum(N);
+                auto EdgeNormal = [](const FVector2D& A, const FVector2D& B) -> FVector2D
+                {
+                        const FVector2D D = (B - A).GetSafeNormal();
+                        return FVector2D(D.Y, -D.X);
+                };
+                for (int32 i = 0; i < N; i++)
+                {
+                        const FVector2D nIn  = (i > 0)     ? EdgeNormal(Pts[i - 1], Pts[i]) : FVector2D::ZeroVector;
+                        const FVector2D nOut = (i < N - 1) ? EdgeNormal(Pts[i], Pts[i + 1]) : FVector2D::ZeroVector;
+                        FVector2D m;
+                        if (nIn.IsNearlyZero())      m = nOut;
+                        else if (nOut.IsNearlyZero()) m = nIn;
+                        else
+                        {
+                                m = (nIn + nOut).GetSafeNormal();
+                                const float c = FVector2D::DotProduct(m, nOut);
+                                m *= (FMath::Abs(c) > 0.2f) ? (1.f / c) : 5.f;
+                        }
+                        if (m.IsNearlyZero()) m = FVector2D(1, 0);
+                        Miter[i] = m;
+                }
+
+                TArray<FVector> BallastL, BallastR, RailCL, RailCR;
+                BallastL.SetNum(N); BallastR.SetNum(N);
+                TArray<FVector> RailL_L, RailR_L, RailL_R, RailR_R;
+                RailL_L.SetNum(N); RailR_L.SetNum(N); RailL_R.SetNum(N); RailR_R.SetNum(N);
+                for (int32 i = 0; i < N; i++)
+                {
+                        const FVector2D P = Pts[i];
+                        const FVector2D M = Miter[i];
+                        const FVector2D Tan(-M.Y, M.X);
+                        BallastL[i] = FVector(P + M * BallastHalfW, BallastZ);
+                        BallastR[i] = FVector(P - M * BallastHalfW, BallastZ);
+
+                        const FVector2D CL = P + Tan * (GaugeUE * 0.5f);
+                        const FVector2D CR = P - Tan * (GaugeUE * 0.5f);
+                        RailL_L[i] = FVector(CL + M * RailHalfW, RailZ);
+                        RailR_L[i] = FVector(CL - M * RailHalfW, RailZ);
+                        RailL_R[i] = FVector(CR + M * RailHalfW, RailZ);
+                        RailR_R[i] = FVector(CR - M * RailHalfW, RailZ);
+                }
+
+                for (int32 i = 0; i < N - 1; i++)
+                {
+                        AddRailQuad(OutBallastData, BallastR[i], BallastL[i], BallastL[i + 1], BallastR[i + 1], BallastColor, 1.f);
+                        AddRailQuad(OutRailData, RailR_L[i], RailL_L[i], RailL_L[i + 1], RailR_L[i + 1], RailColor, 0.f);
+                        AddRailQuad(OutRailData, RailR_R[i], RailL_R[i], RailL_R[i + 1], RailR_R[i + 1], RailColor, 0.f);
+                }
+        }
+
+        RecomputeNormals(OutBallastData);
+        RecomputeNormals(OutRailData);
+}
+
+// ============================================================================
+// GeneratePOIMarkers — coloured pins for amenity/shop/tourism POIs
+// ============================================================================
+void FGeoMeshGenerator::GeneratePOIMarkers(
+        const TArray<FGeoPOI>& POIs,
+        FMeshData& OutPOIData,
+        float MarkerRadius,
+        float MarkerHeight)
+{
+        OutPOIData.Reset();
+        if (POIs.Num() == 0) return;
+
+        const int32 Sides = 8;
+        const float R = FMath::Max(MarkerRadius, 20.f);
+        const float H = FMath::Max(MarkerHeight, 50.f);
+        const float BaseZ = 8.f;
+
+        for (const FGeoPOI& POI : POIs)
+        {
+                const FColor Col = FGeoPOIHelpers::MarkerColorForPOI(POI).ToFColor(true);
+                const float CX = POI.Location.X * ScaleFactor;
+                const float CY = -POI.Location.Y * ScaleFactor;
+
+                const int32 BaseIdx = OutPOIData.Vertices.Num();
+                OutPOIData.Vertices.Add(FVector(CX, CY, BaseZ));
+                OutPOIData.VertexColors.Add(Col);
+                OutPOIData.Normals.Add(FVector::UpVector);
+                OutPOIData.UV0.Add(FVector2D(0.5f, 0.5f));
+                OutPOIData.UV1.Add(FVector2D::ZeroVector);
+                OutPOIData.Tangents.Add(FProcMeshTangent(FVector(1, 0, 0), false));
+
+                for (int32 s = 0; s <= Sides; s++)
+                {
+                        const float A = (2.f * PI * s) / Sides;
+                        const FVector2D Dir(FMath::Cos(A), FMath::Sin(A));
+                        OutPOIData.Vertices.Add(FVector(CX + Dir.X * R, CY + Dir.Y * R, BaseZ));
+                        OutPOIData.VertexColors.Add(Col);
+                        OutPOIData.Normals.Add(FVector::UpVector);
+                        OutPOIData.UV0.Add(FVector2D(0.5f + Dir.X * 0.5f, 0.5f + Dir.Y * 0.5f));
+                        OutPOIData.UV1.Add(FVector2D::ZeroVector);
+                        OutPOIData.Tangents.Add(FProcMeshTangent(FVector(1, 0, 0), false));
+                }
+
+                const int32 TopIdx = OutPOIData.Vertices.Num();
+                OutPOIData.Vertices.Add(FVector(CX, CY, BaseZ + H));
+                OutPOIData.VertexColors.Add(Col);
+                OutPOIData.Normals.Add(FVector::UpVector);
+                OutPOIData.UV0.Add(FVector2D(0.5f, 1.f));
+                OutPOIData.UV1.Add(FVector2D::ZeroVector);
+                OutPOIData.Tangents.Add(FProcMeshTangent(FVector(1, 0, 0), false));
+
+                for (int32 s = 0; s < Sides; s++)
+                {
+                        const int32 A = BaseIdx + 1 + s;
+                        const int32 B = BaseIdx + 1 + s + 1;
+                        OutPOIData.Triangles.Add(BaseIdx);
+                        OutPOIData.Triangles.Add(B);
+                        OutPOIData.Triangles.Add(A);
+                        OutPOIData.Triangles.Add(TopIdx);
+                        OutPOIData.Triangles.Add(A);
+                        OutPOIData.Triangles.Add(B);
+                }
+        }
+
+        RecomputeNormals(OutPOIData);
+}
+
+// ============================================================================
+// AppendOSMTreeTransforms — place instanced trees at natural=tree nodes
+// ============================================================================
+void FGeoMeshGenerator::AppendOSMTreeTransforms(
+        const TArray<FGeoTree>& Trees,
+        TArray<FTransform>& OutTreeTransforms,
+        float InScaleFactor,
+        float GroundOffset)
+{
+        for (const FGeoTree& Tree : Trees)
+        {
+                const float WX = Tree.Location.X * InScaleFactor;
+                const float WY = -Tree.Location.Y * InScaleFactor;
+                const float H = Tree.Height > 0.f ? Tree.Height : 10.f;
+                const float S = FMath::Clamp(H / 10.f, 0.5f, 2.5f);
+                const int32 Hash = FMath::Abs((int32)(Tree.Location.X * 17.3f + Tree.Location.Y * 11.1f));
+                const float Yaw = (float)(Hash % 360);
+                OutTreeTransforms.Add(FTransform(
+                        FRotator(0.f, Yaw, 0.f),
+                        FVector(WX, WY, GroundOffset + 50.f),
+                        FVector(S)));
+        }
 }
 
 // ============================================================================
@@ -2023,10 +4815,21 @@ void FGeoMeshGenerator::GenerateVegetationMeshes(const TArray<FGeoVegetation>& V
                 if (Veg.Points.Num() < 3) continue;
                 TArray<FVector> LP;
                 for (const FVector2D& P : Veg.Points)
-                        LP.Add(FVector(P.X * ScaleFactor, P.Y * ScaleFactor, 0.f));
-                FColor VC(50, 140, 40);
+                        LP.Add(FVector(P.X * ScaleFactor, -P.Y * ScaleFactor, 0.f));
+                // Use the per-area colour from OSM (green for grass/forest, brown for
+                // construction/brownfield) instead of a single hard-coded green, so bare
+                // ground does not read as a lawn.
+                FColor VC = Veg.Color.ToFColor(false);
+                const int32 VStart = OutVegetationData.Vertices.Num();
                 AddPolygonTriangulated(OutVegetationData, LP, 5.f, VC);
+                // Per-area surface-atlas slice: bare construction/brownfield/landfill
+                // ground uses the same paved slice (2) as sidewalks (M_Area is shared
+                // between sidewalk + vegetation), everything else stays grass (3).
+                const bool bBareGround = (Veg.VegType == TEXT("construction")
+                        || Veg.VegType == TEXT("brownfield") || Veg.VegType == TEXT("landfill"));
+                FillSliceUV1(OutVegetationData, VStart, bBareGround ? 2.f : 3.f);
         }
+        RecomputeNormals(OutVegetationData);
 }
 
 // ============================================================================
@@ -2051,7 +4854,7 @@ void FGeoMeshGenerator::GenerateVegetationTransforms(
         for (const FGeoBuilding& B : Buildings)
         {
                 TArray<FVector2D> Poly;
-                for (const FVector2D& N : B.Nodes) Poly.Add(FVector2D(N.X * ScaleFactor, N.Y * ScaleFactor));
+                for (const FVector2D& N : B.Nodes) Poly.Add(FVector2D(N.X * ScaleFactor, -N.Y * ScaleFactor));
                 BldgPolys.Add(Poly);
         }
 
@@ -2063,8 +4866,8 @@ void FGeoMeshGenerator::GenerateVegetationTransforms(
                 if (R.Points.Num() < 2) continue;
                 float HW = (R.Width > 0.f ? R.Width * ScaleFactor : 600.f) * 0.5f;
                 for (int32 i = 0; i < R.Points.Num() - 1; i++)
-                        RoadSegs.Add({ FVector2D(R.Points[i].X * ScaleFactor, R.Points[i].Y * ScaleFactor),
-                                FVector2D(R.Points[i + 1].X * ScaleFactor, R.Points[i + 1].Y * ScaleFactor), HW });
+                        RoadSegs.Add({ FVector2D(R.Points[i].X * ScaleFactor, -R.Points[i].Y * ScaleFactor),
+                                FVector2D(R.Points[i + 1].X * ScaleFactor, -R.Points[i + 1].Y * ScaleFactor), HW });
         }
 
         // Point-in-polygon test
@@ -2094,11 +4897,16 @@ void FGeoMeshGenerator::GenerateVegetationTransforms(
         for (const FGeoVegetation& Veg : Vegetations)
         {
                 if (Veg.Points.Num() < 3) continue;
+                // Bare-ground areas (construction sites, brownfield, landfill) are dirt
+                // lots — never scatter grass blades or trees over them.
+                if (Veg.VegType == TEXT("construction") || Veg.VegType == TEXT("brownfield")
+                        || Veg.VegType == TEXT("landfill"))
+                        continue;
                 float MnX = FLT_MAX, MxX = -FLT_MAX, MnY = FLT_MAX, MxY = -FLT_MAX;
                 TArray<FVector2D> VP;
                 for (const FVector2D& P : Veg.Points)
                 {
-                        float UX = P.X * ScaleFactor, UY = P.Y * ScaleFactor;
+                        float UX = P.X * ScaleFactor, UY = -P.Y * ScaleFactor;
                         VP.Add(FVector2D(UX, UY));
                         if (UX < MnX) MnX = UX; if (UX > MxX) MxX = UX;
                         if (UY < MnY) MnY = UY; if (UY > MxY) MxY = UY;

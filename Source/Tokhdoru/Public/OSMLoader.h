@@ -33,6 +33,8 @@ public:
         const TArray<FGeoPOI>& GetPOIs() const { return POIs; }
         const TArray<FGeoTree>& GetTrees() const { return Trees; }
         const TArray<FGeoRailway>& GetRailways() const { return Railways; }
+        const TArray<FGeoModelInstance>& GetModelInstances() const { return ModelInstances; }
+        const TArray<FElevationSample>& GetElevationSamples() const { return ElevationSamples; }
 
         double GetMinLat() const { return MinLat; }
         double GetMaxLat() const { return MaxLat; }
@@ -92,6 +94,8 @@ private:
         TArray<FGeoPOI> POIs;
         TArray<FGeoTree> Trees;
         TArray<FGeoRailway> Railways;
+        TArray<FGeoModelInstance> ModelInstances;
+        TArray<FElevationSample> ElevationSamples;
 
         double CenterLatitude, CenterLongitude;
         double MinLat, MaxLat, MinLon, MaxLon;

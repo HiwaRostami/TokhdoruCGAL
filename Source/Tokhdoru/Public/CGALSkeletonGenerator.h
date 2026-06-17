@@ -46,10 +46,21 @@ struct FCGALSkeletonEdge
 // normalization. Boundary vertices have Time=0, interior vertices have
 // Time>0 proportional to their distance from the polygon boundary.
 // ============================================================================
+// ============================================================================
+// FCGALSkeletonFace - One roof panel of the straight skeleton, corresponding
+// to a single footprint edge. VertexIndices index into
+// FCGALSkeletonResult.Vertices and list the face boundary in order.
+// ============================================================================
+struct FCGALSkeletonFace
+{
+	TArray<int32> VertexIndices;
+};
+
 struct FCGALSkeletonResult
 {
 	TArray<FCGALSkeletonVertex> Vertices;
 	TArray<FCGALSkeletonEdge> Edges;
+	TArray<FCGALSkeletonFace> Faces;
 	float MaxTime;          // Maximum skeleton time (for height normalization)
 
 	FCGALSkeletonResult() : MaxTime(0.f) {}
@@ -69,11 +80,25 @@ public:
 	 *  Returns the skeleton result with vertices, edges, and timing info. */
 	static FCGALSkeletonResult GenerateSkeleton(const TArray<FVector2D>& Polygon);
 
+	/** Straight skeleton for a polygon WITH HOLES (inner courtyards). */
+	static FCGALSkeletonResult GenerateSkeleton(
+		const TArray<FVector2D>& Polygon,
+		const TArray<TArray<FVector2D>>& Holes);
+
 	/** Triangulate a 2D polygon using CGAL Constrained Delaunay Triangulation.
 	 *  OutTriangles contains vertex indices (into combined Poly+SteinerPoints array).
 	 *  OutSteinerPoints receives any Steiner points inserted by the CDT. */
 	static void TriangulateWithCGAL(
 		const TArray<FVector2D>& Polygon,
+		TArray<int32>& OutTriangles,
+		TArray<FVector2D>& OutSteinerPoints);
+
+	/** Triangulate a 2D polygon WITH HOLES (courtyards excluded). Indices are
+	 *  into the combined (Polygon ++ OutSteinerPoints) array, where hole
+	 *  vertices appear among the Steiner points. */
+	static void TriangulateWithCGAL(
+		const TArray<FVector2D>& Polygon,
+		const TArray<TArray<FVector2D>>& Holes,
 		TArray<int32>& OutTriangles,
 		TArray<FVector2D>& OutSteinerPoints);
 };

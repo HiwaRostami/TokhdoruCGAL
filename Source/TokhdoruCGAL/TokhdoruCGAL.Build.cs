@@ -29,11 +29,17 @@ public class TokhdoruCGAL : ModuleRules
 
         // ========================================================================
         // CGAL Include Path
+        // PRIVATE on purpose: only CGALSkeletonImpl.cpp (in this module's
+        // Private folder) includes <CGAL/...>. The public bridge header
+        // (CGALSkeletonImpl.h) pulls in <vector> only. Keeping this private
+        // guarantees CGAL headers never leak into dependent modules
+        // (Tokhdoru / TokhdoruEditor), which are compiled without RTTI,
+        // without exceptions, and with Unity builds enabled.
         // ========================================================================
         string CGALIncludePath = Path.GetFullPath(
             Path.Combine(ModuleDirectory, "..", "ThirdParty", "CGAL", "include")
         );
-        PublicIncludePaths.Add(CGALIncludePath);
+        PrivateIncludePaths.Add(CGALIncludePath);
 
         // ========================================================================
         // CGAL Preprocessor Definitions
